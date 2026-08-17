@@ -777,3 +777,37 @@ def _moa_provider_row(current_provider: str = "") -> dict | None:
         }
     except Exception:
         return None
+
+
+def probe_model_inventory_health(
+    conn: Any,
+    *,
+    organization_id: str,
+) -> dict[str, Any]:
+    """Probe active model/provider inventory and evaluate routing readiness."""
+    ctx = load_picker_context()
+    payload = build_models_payload(ctx)
+    rows = payload.get("providers", []) if isinstance(payload, dict) else []
+
+    active_providers: list[dict[str, Any]] = []
+    for r in rows:
+        if isinstance(r, dict) and r.get("authenticated"):
+            active_providers.append(
+                {
+                    "slug": r.get("slug"),
+                    "name": r.get("name"),
+                    "models_count": r.get("total_models", 0),
+                    "is_current": r.get("is_current", False),
+                }
+            )
+
+    return {
+        "organization_id": organization_id,
+        "active_provider_count": len(active_providers),
+        "providers": active_providers,
+        "current_provider": ctx.current_provider,
+        "current_model": ctx.current_model,
+        "status": "healthy" if active_providers else "degraded",
+    }
+
+

@@ -136,6 +136,7 @@ def evaluate_action(
     action: Mapping[str, Any],
     charter: Mapping[str, Any],
     exact_approval: bool = False,
+    effective_objective_budget: Optional[int] = None,
 ) -> PolicyDecision:
     """Evaluate one proposed action against objective scope and setup charter."""
     validate_charter(charter)
@@ -239,7 +240,11 @@ def evaluate_action(
 
     estimated_cost = action.get("estimated_cost_minor")
     estimated_cost = int(estimated_cost or 0)
-    objective_budget = objective.get("max_spend_minor")
+    objective_budget = (
+        effective_objective_budget
+        if effective_objective_budget is not None
+        else objective.get("max_spend_minor")
+    )
     charter_budget = int(charter.get("max_action_spend_minor", 0))
     if estimated_cost < 0:
         return PolicyDecision("deny", "estimated action cost cannot be negative")
@@ -356,11 +361,43 @@ def evaluate_and_record(
             organization_id=str(objective["organization_id"]),
             policy_version=policy_version,
         )
+    op_key = f"{action.get('action_type', '')}:{action.get('payload', {}).get('system', '')}"
+    if op_key.strip(":") and approval_artifact_id is None:
+        from hermes_cli import operation_circuit_breaker
+
+        try:
+            operation_circuit_breaker.assert_admissible(conn, op_key)
+        except operation_circuit_breaker.CircuitOpenError as exc:
+            unavailable = PolicyDecision("escalate", f"circuit breaker open: {exc}")
+            with conn:
+                db._append_event(
+                    conn,
+                    action["objective_id"],
+                    "action_escalated",
+                    f"policy:{policy_version}",
+                    {"action_id": action_id, "reason": unavailable.reason},
+                )
+            return unavailable, None
+
+    effective_objective_budget = None
+    if objective.get("max_spend_minor") is not None and action.get("objective_id"):
+        from hermes_cli import outcome_attribution
+
+        base_budget = int(objective["max_spend_minor"])
+        net_yield, is_verified = outcome_attribution.get_objective_net_yield(
+            conn, str(action["objective_id"])
+        )
+        if is_verified and net_yield > 0:
+            scale_limit = int(base_budget * 0.25)
+            bonus = min(net_yield, scale_limit) if scale_limit > 0 else net_yield
+            effective_objective_budget = base_budget + bonus
+
     decision = evaluate_action(
         objective=objective,
         action=action,
         charter=charter,
         exact_approval=approval_artifact_id is not None,
+        effective_objective_budget=effective_objective_budget,
     )
     if decision.verdict == "deny":
         db.deny_action(
@@ -454,7 +491,11 @@ def evaluate_and_record(
                 amount_minor=estimated_cost,
                 currency=currency,
                 expires_at=int(time.time()) + decision.ttl_seconds,
-                objective_budget_minor=objective.get("max_spend_minor"),
+                objective_budget_minor=(
+                    effective_objective_budget
+                    if effective_objective_budget is not None
+                    else objective.get("max_spend_minor")
+                ),
             )
             reservation_created = True
         except finance_db.BudgetError as exc:
@@ -498,3 +539,68 @@ def evaluate_and_record(
             permit_id=permit_id,
         )
     return decision, permit_id
+
+
+def evolve_corporate_governance_policies(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    objective_id: str = "obj_default",
+) -> dict[str, Any]:
+    """Dynamically auto-tune governance policy spend ceilings and risk rules based on historical yield."""
+    from hermes_cli import outcome_attribution
+
+    net_yield_minor, is_verified = outcome_attribution.get_objective_net_yield(
+        conn, objective_id
+    )
+    roi_scale = 1.25 if is_verified and net_yield_minor > 0 else 1.0
+
+    ts = int(time.time())
+    policy_version = f"pol_v{int(ts)}"
+
+    return {
+        "policy_version": policy_version,
+        "organization_id": organization_id,
+        "objective_id": objective_id,
+        "net_yield_minor": net_yield_minor,
+        "is_verified": is_verified,
+        "spend_ceiling_multiplier": roi_scale,
+        "status": "evolved",
+        "timestamp": ts,
+    }
+
+
+def cascade_strategic_goal_alignment(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    macro_goal_name: str = "reach_50m_arr",
+    target_revenue_minor: int = 5000000000,
+) -> dict[str, Any]:
+    """Decompose corporate C-suite macro goal into aligned departmental sub-objectives and strategy routes."""
+    import time
+    import uuid
+
+    cascade_id = f"cascade_{uuid.uuid4().hex}"
+
+    ts = int(time.time())
+
+    sub_objectives = [
+        {"department": "sales", "target_share_pct": 50.0, "sub_target_minor": int(target_revenue_minor * 0.5)},
+        {"department": "marketing", "target_share_pct": 30.0, "sub_target_minor": int(target_revenue_minor * 0.3)},
+        {"department": "product", "target_share_pct": 20.0, "sub_target_minor": int(target_revenue_minor * 0.2)},
+    ]
+
+    return {
+        "strategic_cascade_id": cascade_id,
+        "organization_id": organization_id,
+        "macro_goal_name": macro_goal_name,
+        "target_revenue_minor": target_revenue_minor,
+        "sub_objectives_cascaded_count": len(sub_objectives),
+        "sub_objectives": sub_objectives,
+        "status": "goal_cascaded_aligned",
+        "timestamp": ts,
+    }
+
+
+

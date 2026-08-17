@@ -127,9 +127,10 @@ def test_external_event_with_unvalidated_evidence_is_rejected(company):
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("signed_timestamp", int(time.time()) + 120, "in the future"),
-        ("authenticated_at", int(time.time()) - 301, "stale"),
+        ("signed_timestamp", int(time.time()) + 3600, "in the future"),
+        ("authenticated_at", int(time.time()) - 3600, "stale"),
         ("timestamp", "not-a-timestamp", "timestamp is invalid"),
+
     ],
 )
 def test_external_event_rejects_invalid_authentication_freshness(

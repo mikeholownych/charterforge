@@ -182,3 +182,20 @@ def resolve_for_action(
             (action_id, verification_id, int(time.time()), obligation_id),
         )
     return obligation_id
+
+
+def dispatch_saga_compensations(
+    conn: sqlite3.Connection,
+    organization_id: str,
+) -> list[dict[str, Any]]:
+    """Scan and return outstanding saga compensation obligations for an organization."""
+    ensure_schema(conn)
+    rows = conn.execute(
+        """SELECT * FROM compensation_obligations
+            WHERE organization_id = ? AND status = 'required'
+            ORDER BY created_at ASC""",
+        (organization_id,),
+    ).fetchall()
+
+    return [dict(r) for r in rows]
+

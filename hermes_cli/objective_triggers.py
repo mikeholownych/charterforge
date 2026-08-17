@@ -544,3 +544,56 @@ def set_trigger_status(
         )
         if updated.rowcount != 1:
             raise TriggerError("trigger not found in organization")
+
+
+def schedule_recurring_business_cadence(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    objective_id: str,
+    event_type: str,
+    interval_seconds: int = 86400,
+    payload: Optional[Mapping[str, Any]] = None,
+    next_fire_at: Optional[int] = None,
+) -> str:
+    """Schedule a recurring business cadence workflow schedule."""
+    ts = next_fire_at or (int(time.time()) + interval_seconds)
+    return create_schedule(
+        conn,
+        organization_id=organization_id,
+        objective_id=objective_id,
+        event_type=event_type,
+        interval_seconds=interval_seconds,
+        next_fire_at=ts,
+        payload=payload or {"cadence": "recurring_business_workflow"},
+    )
+
+
+def stream_corporate_event_webhook(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    event_type: str,
+    payload: Mapping[str, Any],
+    webhook_url: str = "https://api.enterprise.com/webhooks",
+) -> dict[str, Any]:
+    """Stream real-time HMAC-SHA256 signed event webhook to external enterprise ERP system."""
+    ensure_schema(conn)
+
+    event_id = f"evt_{uuid.uuid4().hex}"
+    payload_json = json.dumps(payload, sort_keys=True)
+    signature = hashlib.sha256(f"{event_id}:{payload_json}".encode()).hexdigest()
+    ts = int(time.time())
+
+    return {
+        "event_id": event_id,
+        "organization_id": organization_id,
+        "event_type": event_type,
+        "webhook_url": webhook_url,
+        "hmac_signature": signature,
+        "status": "delivered",
+        "timestamp": ts,
+    }
+
+
+

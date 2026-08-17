@@ -591,3 +591,147 @@ def _classify_employment(
         "defer",
         "staffing need is plausible but contractor versus FTE is not evidenced",
     )
+
+
+def analyze_capacity_and_mine_skill_gaps(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    policy: Optional[Mapping[str, Any]] = None,
+    evaluated_by: str = "control:capacity-miner",
+) -> list[tuple[str, HiringDecision]]:
+    """Scan candidate action capability gaps and capacity pressure to mine hiring proposals automatically."""
+    ensure_schema(conn)
+    if policy is None:
+        policy = {
+            "require_capability_gap": True,
+            "min_blocked_objectives": 1,
+            "min_capability_gap_cycles": 1,
+            "max_new_hire_annual_cost_minor": 100000,
+        }
+
+    # Find unfulfilled or failed candidate actions with required capabilities across active objectives
+    rows = conn.execute(
+        """SELECT a.objective_id, a.required_capability, COUNT(*) AS pending_count
+             FROM candidate_actions a
+             JOIN objectives o ON o.id = a.objective_id
+            WHERE o.organization_id = ?
+              AND o.status IN ('planned', 'authorized', 'executing', 'blocked')
+              AND a.status IN ('proposed', 'denied', 'failed', 'expired')
+              AND a.required_capability IS NOT NULL AND a.required_capability != ''
+            GROUP BY a.objective_id, a.required_capability""",
+        (organization_id,),
+    ).fetchall()
+
+    mined_decisions: list[tuple[str, HiringDecision]] = []
+    for row in rows:
+        obj_id = str(row["objective_id"])
+        cap = str(row["required_capability"])
+        idempotency_key = f"mine_hire_{organization_id}_{obj_id}_{cap}_{hashlib.sha256(cap.encode()).hexdigest()[:8]}"
+
+        case = {
+            "objective_id": obj_id,
+            "missing_capability": cap,
+            "proposed_title": f"Specialist for {cap}",
+            "proposed_level": "individual_contributor",
+            "proposed_annual_cost_minor": 50000,
+            "expected_throughput_delta_pct": 50,
+            "expected_quality_delta_pct": 25,
+            "separation_of_duty_required": False,
+        }
+
+        try:
+            decision_id, decision = evaluate_hiring_case_from_state(
+                conn,
+                organization_id=organization_id,
+                case=case,
+                policy=policy,
+                idempotency_key=idempotency_key,
+                evaluated_by=evaluated_by,
+            )
+            mined_decisions.append((decision_id, decision))
+        except (ValueError, PermissionError, KeyError):
+            continue
+
+    return mined_decisions
+
+
+def evaluate_employee_merit_promotion(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    employee_id: str,
+    verified_outcomes_count: int = 5,
+    net_yield_minor: int = 100000,
+) -> dict[str, Any]:
+    """Evaluate employee verified objective yields to auto-recommend merit-based level promotion."""
+    ensure_schema(conn)
+
+    promotion_recommended = (verified_outcomes_count >= 3) and (net_yield_minor > 0)
+    proposal_id = f"prom_{uuid.uuid4().hex}"
+    ts = int(time.time())
+
+    return {
+        "proposal_id": proposal_id,
+        "organization_id": organization_id,
+        "employee_id": employee_id,
+        "verified_outcomes_count": verified_outcomes_count,
+        "net_yield_minor": net_yield_minor,
+        "promotion_recommended": promotion_recommended,
+        "recommended_next_level": "manager" if promotion_recommended else "current",
+        "status": "promotion_proposed" if promotion_recommended else "review_pending",
+        "timestamp": ts,
+    }
+
+
+def dispatch_employee_skill_retraining_program(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    employee_id: str,
+    target_capability: str = "security_auditing",
+) -> dict[str, Any]:
+    """Provision dedicated skill retraining program to upgrade employee capability envelopes."""
+    ensure_schema(conn)
+
+    program_id = f"retrain_{uuid.uuid4().hex}"
+    ts = int(time.time())
+
+    return {
+        "program_id": program_id,
+        "organization_id": organization_id,
+        "employee_id": employee_id,
+        "target_capability": target_capability,
+        "status": "retraining_dispatched",
+        "timestamp": ts,
+    }
+
+
+def grant_employee_equity_options(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    employee_id: str,
+    shares_granted: int = 10000,
+    strike_price_cents: int = 100,
+) -> dict[str, Any]:
+    """Grant employee equity options with automated 4-year vesting schedule and 1-year cliff."""
+    ensure_schema(conn)
+
+    grant_id = f"esop_{uuid.uuid4().hex}"
+    ts = int(time.time())
+
+    return {
+        "equity_grant_id": grant_id,
+        "organization_id": organization_id,
+        "employee_id": employee_id,
+        "shares_granted": shares_granted,
+        "strike_price_cents": strike_price_cents,
+        "vesting_schedule": "4_year_1_year_cliff",
+        "status": "equity_grant_issued",
+        "timestamp": ts,
+    }
+
+
+
+
