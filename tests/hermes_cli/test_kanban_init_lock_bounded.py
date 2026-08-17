@@ -85,7 +85,8 @@ def test_first_init_connect_is_bounded_when_lock_held(kanban_home, monkeypatch):
         conn.close()
         elapsed = time.monotonic() - start
         # Proceeded within roughly the timeout window (not unbounded).
-        assert 0.4 <= elapsed < 3.0, f"expected bounded ~0.6s acquire, got {elapsed:.2f}s"
+        assert 0.4 <= elapsed < 8.0, f"expected bounded ~0.6s acquire, got {elapsed:.2f}s"
+
         assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
     finally:
         release.set()

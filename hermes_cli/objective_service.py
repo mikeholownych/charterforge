@@ -15,6 +15,7 @@ from hermes_cli.objective_adapters import (
     IndependentVerifierRegistry,
     register_accounting_adapters,
     register_commitment_adapters,
+    register_external_verifiers,
     register_kanban_adapters,
     register_email_adapters,
     register_payment_adapters,
@@ -114,6 +115,11 @@ def build_runtime(
         authority_conn=conn,
     )
     register_commitment_adapters(
+        executor,
+        verifier,
+        authority_conn=conn,
+    )
+    register_external_verifiers(
         executor,
         verifier,
         authority_conn=conn,

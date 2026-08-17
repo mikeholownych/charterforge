@@ -520,7 +520,30 @@ def sync_authoritative_links(
     return counts
 
 
+def get_objective_net_yield(
+    conn: sqlite3.Connection, objective_id: str
+) -> tuple[int, bool]:
+    """Return (net_yield_minor, is_verified) for an objective's non-contradicted attributions."""
+    ensure_schema(conn)
+    row = conn.execute(
+        """SELECT COALESCE(SUM(CASE WHEN value_minor IS NULL THEN 0 ELSE value_minor END), 0) AS net_yield,
+                  MAX(CASE WHEN evidence_strength IN ('independently_verified', 'direct_provider_link') THEN 1 ELSE 0 END) AS has_verified
+             FROM outcome_attributions attribution
+            WHERE objective_id = ?
+              AND verdict IN ('pass', 'succeeded', 'verified', 'settled')
+              AND NOT EXISTS (
+                SELECT 1 FROM outcome_attribution_contradictions contradiction
+                 WHERE contradiction.attribution_id = attribution.id
+              )""",
+        (objective_id,),
+    ).fetchone()
+    if not row:
+        return 0, False
+    return int(row["net_yield"] or 0), bool(row["has_verified"])
+
+
 def planning_snapshot(
+
     conn: sqlite3.Connection, organization_id: str
 ) -> dict[str, Any]:
     """Return bounded aggregates without party, provider, or raw evidence data."""

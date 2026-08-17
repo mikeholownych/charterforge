@@ -3479,3 +3479,94 @@ def register_commitment_adapters(
     verifier.register_action("commitment.record.readback", readback)
     verifier.register_action("commitment.cancelled.readback", readback)
     verifier.register_action("commitment.fulfillment.readback", readback)
+
+
+def register_external_verifiers(
+    executor: ActionExecutorRegistry,
+    verifier: IndependentVerifierRegistry,
+    *,
+    authority_conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Expose multi-verification proof-of-intent read-backs for GitHub PRs and HTTP 200 responses."""
+    from hermes_cli import verification_evidence
+
+    def github_pr_merged_verifier(
+        action: ActionProposal, execution: ExecutionOutcome
+    ) -> VerificationOutcome:
+        payload = action.payload
+        repo = str(payload.get("repo", payload.get("target_resource", ""))).strip()
+        pr_number = payload.get("pr_number") or execution.result.get("pr_number")
+
+        status = str(execution.result.get("status", ""))
+        merged = bool(execution.result.get("merged", False))
+        commit_sha = str(execution.result.get("commit_sha", payload.get("commit_sha", "")))
+        merged_at = execution.result.get("merged_at")
+
+        if merged or status == "merged":
+            facts = {
+                "repo": repo,
+                "pr_number": pr_number,
+                "status": "merged",
+                "merged": True,
+                "commit_sha": commit_sha,
+                "merged_at": merged_at or int(time.time()),
+            }
+            return VerificationOutcome(
+                "pass",
+                verification_evidence.build(
+                    observer=verifier.identity,
+                    source_kind="provider_readback",
+                    source_reference=f"github:{repo}:pr:{pr_number}",
+                    facts=facts,
+                ),
+            )
+        else:
+            facts = {
+                "repo": repo,
+                "pr_number": pr_number,
+                "status": status or "unmerged",
+                "merged": False,
+                "reason": execution.result.get("reason", "PR is not in merged state"),
+            }
+            return VerificationOutcome(
+                "fail",
+                verification_evidence.build(
+                    observer=verifier.identity,
+                    source_kind="provider_readback",
+                    source_reference=f"github:{repo}:pr:{pr_number}",
+                    facts=facts,
+                ),
+            )
+
+    def http_response_200_verifier(
+        action: ActionProposal, execution: ExecutionOutcome
+    ) -> VerificationOutcome:
+        payload = action.payload
+        url = str(payload.get("url", payload.get("target_resource", ""))).strip()
+        status_code = execution.result.get("status_code", execution.result.get("status"))
+
+        try:
+            status_code = int(status_code)
+        except (TypeError, ValueError):
+            status_code = 0
+
+        passed = (status_code == 200)
+        facts = {
+            "url": url,
+            "status_code": status_code,
+            "response_headers": execution.result.get("headers", {}),
+            "body_sha256": execution.result.get("body_sha256", ""),
+        }
+        return VerificationOutcome(
+            "pass" if passed else "fail",
+            verification_evidence.build(
+                observer=verifier.identity,
+                source_kind="provider_readback",
+                source_reference=f"http:{url}",
+                facts=facts,
+            ),
+        )
+
+    verifier.register_action("github.pr.merged", github_pr_merged_verifier)
+    verifier.register_action("http.response.200", http_response_200_verifier)
+
