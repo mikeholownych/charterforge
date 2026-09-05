@@ -326,12 +326,13 @@ def _expand_git_reference(
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
         result = subprocess.run(
-            ["git", *args],
+            ["git", *harden_git_argv(args)],
             cwd=cwd,
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=30,
             stdin=subprocess.DEVNULL,
+                        env=noninteractive_git_env(),
             **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:

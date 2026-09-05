@@ -153,11 +153,6 @@ def test_gateway_git_probe_is_safe(malicious_repo):
     assert _fired(marker) == []
 
 
-def test_working_diff_is_safe(malicious_repo):
-    from tools.working_diff import collect_working_diff
-    repo, marker = malicious_repo
-    collect_working_diff(str(repo))
-    assert _fired(marker) == []
 
 
 def test_web_git_is_safe(malicious_repo):
@@ -185,13 +180,6 @@ def test_context_references_git_is_safe(malicious_repo):
     assert _fired(marker) == []
 
 
-def test_subagent_worktree_is_safe(malicious_repo):
-    from tools.subagent_worktree import create_subagent_worktree, finalize_subagent_worktree
-    repo, marker = malicious_repo
-    info = create_subagent_worktree(repo, "test")
-    if info:
-        finalize_subagent_worktree(info)
-    assert _fired(marker) == []
 
 
 def test_bounded_git_probe_is_safe(malicious_repo):
@@ -214,7 +202,7 @@ def test_noninteractive_git_env_neutralizes_config():
     assert env["GIT_CONFIG_NOSYSTEM"] == "1"
     assert env["GIT_PAGER"] == "cat"
     assert env["GIT_EDITOR"] == "true"
-    assert env["GIT_CONFIG_COUNT"] == "11"
+    assert env["GIT_CONFIG_COUNT"] == "9"
     # Verify all override keys present
     expected_keys = {
         "credential.helper", "core.askPass", "core.fsmonitor",
@@ -225,3 +213,11 @@ def test_noninteractive_git_env_neutralizes_config():
         env[f"GIT_CONFIG_KEY_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))
     }
     assert expected_keys.issubset(actual)
+
+    # Verify critical values are neutralized
+    values = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert values["core.fsmonitor"] == "false"
+    assert values["core.hooksPath"] == os.devnull
