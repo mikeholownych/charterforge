@@ -251,3 +251,16 @@ def recover_if_needed(
     except Exception:
         # Never block launch — the import of main.py will surface the truth.
         pass
+
+
+def _should_skip_external_secret_sources() -> bool:
+    """Return True if external secret sources should be skipped during early recovery.
+
+    During the very early recovery phase (before main.py imports), we don't want
+    to trigger Bitwarden or other secret-manager network calls — the recovery
+    may be running in a context without proper auth, and the network calls
+    would just add latency and potential failure modes. The normal startup path
+    in env_loader.py will handle external secrets after the process is stable.
+    """
+    return True
+
