@@ -182,13 +182,39 @@ def test_context_references_git_is_safe(malicious_repo):
 
 
 
-def test_bounded_git_probe_is_safe(malicious_repo):
+@pytest.mark.parametrize("caller", ["bounded", "gateway", "coding"])
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (("status", "--porcelain"), "README"),
+        (("diff", "HEAD"), "+changed"),
+        (("diff", "--staged"), "+changed"),
+        (("log", "-1", "-p"), "+hi"),
+        (("show", "HEAD"), "+hi"),
+    ],
+)
+def test_bounded_git_probe_is_safe(malicious_repo, caller, args, expected):
     from hermes_cli._subprocess_compat import bounded_git_probe
     repo, marker = malicious_repo
-    bounded_git_probe(["status", "--porcelain"], timeout=10)
-    bounded_git_probe(["diff", "HEAD"], timeout=10)
-    bounded_git_probe(["diff", "--staged"], timeout=10)
-    bounded_git_probe(["log", "-1", "-p"], timeout=10)
+    if "--staged" in args:
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "README"],
+            check=True,
+            env=noninteractive_git_env(),
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+    if caller == "bounded":
+        out = bounded_git_probe(["git", "-C", str(repo), *args], timeout=10)
+    elif caller == "gateway":
+        from tui_gateway.git_probe import run_git
+
+        out = run_git(str(repo), *args)
+    else:
+        from agent.coding_context import _git
+
+        out = _git(repo, *args)
+    assert expected in out
     assert _fired(marker) == []
 
 

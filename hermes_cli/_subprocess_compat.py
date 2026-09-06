@@ -563,6 +563,9 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
     """Run a short, throwaway ``git`` probe and return stripped stdout, or ``""``
     on ANY failure (nonzero exit, timeout, spawn error, decode error).
 
+    ``argv`` includes the Git executable; only the remaining arguments are
+    passed to the argument hardener.
+
     This is the shared, deadlock-safe replacement for
     ``subprocess.run(["git", ...], timeout=...)`` at fail-open probe call sites
     (``tui_gateway.git_probe.run_git``, ``agent.coding_context._git``).
@@ -600,7 +603,7 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
     hidden-window ``creationflags`` on Windows only.
     """
     result = bounded_probe_run(
-        ["git", *harden_git_argv(argv)],
+        [*argv[:1], *harden_git_argv(argv[1:])],
         timeout=timeout,
         env=noninteractive_git_env(),
     )

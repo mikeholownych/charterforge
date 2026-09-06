@@ -104,6 +104,33 @@ def test_bounded_git_probe_no_hide_flags_off_windows(monkeypatch):
     assert "creationflags" not in spawns[0][1]
 
 
+def test_bounded_git_probe_full_argv_hardening(monkeypatch):
+    from hermes_cli import _subprocess_compat as compat
+
+    spawns = []
+    monkeypatch.setattr(compat, "IS_WINDOWS", False)
+    monkeypatch.setattr(
+        compat.subprocess, "Popen", _make_fake_popen(spawns, stdout="probe\n")
+    )
+    for subcommand in ("status", "diff", "show", "log", "blame"):
+        argv = ["git", "-C", "/repo with spaces", subcommand]
+        original = list(argv)
+        assert compat.bounded_git_probe(argv, timeout=1.5) == "probe"
+        assert len(spawns) == 1
+        cmd, kwargs = spawns.pop()
+        flags = [] if subcommand == "status" else list(compat.NO_DRIVER_DIFF_FLAGS)
+        assert cmd == original + flags
+        assert argv == original
+        env = kwargs["env"]
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        overrides = {
+            env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+            for i in range(int(env["GIT_CONFIG_COUNT"]))
+        }
+        assert overrides["core.fsmonitor"] == "false"
+        assert overrides["diff.external"] == ""
+
+
 def test_bounded_git_probe_nonzero_returncode_returns_empty(monkeypatch):
     from hermes_cli import _subprocess_compat
 
