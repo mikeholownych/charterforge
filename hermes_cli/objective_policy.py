@@ -95,6 +95,34 @@ def validate_charter(charter: Mapping[str, Any]) -> None:
         raise ValueError(
             "agentic.action_approvals TTLs must be positive and bounded"
         )
+    policy = charter.get("blocked_outcome_policy")
+    if policy is not None:
+        if not isinstance(policy, Mapping):
+            raise ValueError("agentic.blocked_outcome_policy must be a mapping")
+        mode = str(policy.get("mode", "advise")).strip()
+        if mode not in {"advise", "autonomous"}:
+            raise ValueError(
+                "agentic.blocked_outcome_policy.mode must be advise or autonomous"
+            )
+        if mode == "autonomous":
+            attempts = policy.get("max_replan_attempts", 3)
+            if not isinstance(attempts, int) or attempts <= 0 or attempts > 25:
+                raise ValueError(
+                    "agentic.blocked_outcome_policy.max_replan_attempts must be "
+                    "a positive integer of at most 25"
+                )
+            backoff = policy.get("replan_backoff_seconds", 60)
+            if not isinstance(backoff, int) or backoff < 0:
+                raise ValueError(
+                    "agentic.blocked_outcome_policy.replan_backoff_seconds must "
+                    "be a non-negative integer"
+                )
+            abandon = policy.get("abandon_after_max", True)
+            if not isinstance(abandon, bool):
+                raise ValueError(
+                    "agentic.blocked_outcome_policy.abandon_after_max must be a "
+                    "boolean"
+                )
     from hermes_cli import resource_budget
 
     resource_limits = {
