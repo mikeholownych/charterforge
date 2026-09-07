@@ -378,6 +378,39 @@ retained for audit, but no action or permit is created. State timestamps and
 provider revisions must come from event or read-back evidence and may not be
 invented by the planner.
 
+## Blocked-objective policy
+
+When an objective cycle cannot proceed (verification fails to prove the
+outcome, or the planner finds no admissible next action), the runtime
+records the block and — by default — raises an advisor handoff for you to
+resolve (`mode: "advise"`).
+
+Charter holders can delegate bounded recovery to the runtime:
+
+```yaml
+agentic:
+  blocked_outcome_policy:
+    mode: autonomous          # advise (default) | autonomous
+    max_replan_attempts: 3    # 1..25; durable per-objective counter
+    replan_backoff_seconds: 60
+    abandon_after_max: true   # else stay blocked and ask
+```
+
+Under `mode: autonomous` the runtime schedules a durable replan event with
+backoff and re-enters planning with the blocked evidence in its snapshot.
+When the attempt budget is exhausted the objective is abandoned — terminal,
+audited, never reported as completed. Two boundaries are absolute:
+
+- Spend, authority-contract, and security blocks
+  (`resource_budget_exhausted`, `planner_contract_violation`,
+  `executor_authority_rejected`) always require human resolution — the
+  policy cannot override them.
+- Operator stop controls (pausing autonomy, master stop) outrank the
+  policy: it only fires while autonomy mode is `autonomous`.
+
+Both the replan and the abandonment are recorded in the business audit
+with the plan/verification evidence and the active policy version.
+
 ## Closed-loop strategy measurement
 
 Charterforge stores KPI definitions, observations, targets, strategy experiments,

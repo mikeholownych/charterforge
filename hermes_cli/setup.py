@@ -4176,6 +4176,59 @@ def setup_agentic_settings(config: dict):
     }
     _validate_initial_mandate(current["initial_mandate"])
 
+    blocked_policy = current.get("blocked_outcome_policy")
+    if not isinstance(blocked_policy, dict):
+        blocked_policy = {}
+    blocked_decision = None
+    try:
+        blocked_idx = prompt_choice(
+            "When an objective gets stuck (blocked), how should the business respond?",
+            [
+                "Advise — pause and ask me (recommended)",
+                "Autonomously replan, bounded",
+            ],
+            1 if blocked_policy.get("mode") == "autonomous" else 0,
+        )
+        if blocked_idx == 1:
+            attempts_default = blocked_policy.get("max_replan_attempts", 3)
+            if not isinstance(attempts_default, int) or not 1 <= attempts_default <= 25:
+                attempts_default = 3
+            while True:
+                attempts_raw = prompt(
+                    "Maximum autonomous replan attempts per blocked objective (1-25)",
+                    str(attempts_default),
+                )
+                try:
+                    max_attempts = int(attempts_raw)
+                except ValueError:
+                    max_attempts = 0
+                if 1 <= max_attempts <= 25:
+                    break
+                print_warning("Replan attempts must be an integer between 1 and 25.")
+                attempts_default = 3
+            abandon_after_max = prompt_yes_no(
+                "Abandon the objective after the replan budget is exhausted?",
+                bool(blocked_policy.get("abandon_after_max", True)),
+            )
+            blocked_decision = {
+                "mode": "autonomous",
+                "max_replan_attempts": max_attempts,
+                "replan_backoff_seconds": 60,
+                "abandon_after_max": abandon_after_max,
+            }
+        else:
+            blocked_decision = "advise"
+    except StopIteration:
+        # The answer stream is exhausted (canned or non-interactive run):
+        # leave the charter untouched so validate_charter's absent-policy
+        # advise default applies.
+        blocked_decision = None
+
+    if blocked_decision == "advise":
+        current.pop("blocked_outcome_policy", None)
+    elif isinstance(blocked_decision, dict):
+        current["blocked_outcome_policy"] = blocked_decision
+
     validate_charter(current)
     config["agentic"] = current
     _bootstrap_agentic_business(current)
