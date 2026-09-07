@@ -582,3 +582,81 @@ class TestAutonomousReplan:
         assert db.blocked_replan_attempts(conn, obj.id) == 0
         # The advisor fallback transitioned authorized→blocked (legal).
         assert db.get_objective(conn, obj.id).status == "blocked"
+
+
+class TestRestartDurability:
+    # Adaptations vs. the planned snippet: connect() already sets
+    # row_factory=sqlite3.Row (redundant per-conn assignment dropped); the
+    # charter comes from the module-level _charter() helper
+    # (autonomous_charter is a pytest fixture, not callable here); each
+    # claimed event is finalized with finish_objective_event(status=
+    # "completed") exactly as the real loop does after _run_claimed_event —
+    # otherwise block #1's live claim keeps the one-claim-per-objective
+    # guard blocking the post-restart claim; and the final durable-inbox
+    # count is 1, not 2 — with max_replan_attempts=2 the second blocked
+    # cycle records attempt 2 and ABANDONS instead of enqueuing a third
+    # replan lifecycle.
+    def test_replan_survives_restart(self, tmp_path):
+        """The scheduled replan event is durable: a fresh runtime instance on
+        the same store picks it up and continues the attempt sequence —
+        counter and pending event survive process death, and the autonomous
+        loop completes (abandon) across the restart."""
+        from hermes_cli import objectives_db as db
+
+        path = tmp_path / "restart-durability.db"
+        with db.connect_closing(str(path)) as conn:
+            obj = _accepted_objective_with_event(conn)
+            rt = _make_runtime(conn, _charter())
+            claimed = _claim_one(conn)
+            assert claimed is not None
+            rt._run_claimed_event(claimed)  # block #1 -> replan scheduled
+            db.finish_objective_event(
+                conn, claimed["id"], runtime_id="test-runtime",
+                status="completed",
+            )
+            assert db.blocked_replan_attempts(conn, obj.id) == 1
+            obj_id = obj.id
+
+        # Simulate restart: zero the backoff so the event is due now, then a
+        # fresh runtime instance on the same store.
+        with db.connect_closing(str(path)) as conn2:
+            conn2.execute(
+                "UPDATE objective_inbox SET available_at = 0 "
+                "WHERE event_type='objective.replan'"
+            )
+            conn2.commit()
+            rt2 = _make_runtime(conn2, _charter())
+            claimed2 = _claim_one(conn2)
+            assert claimed2 is not None
+            assert claimed2["event_type"] == "objective.replan"
+            rt2._run_claimed_event(claimed2)  # block #2 -> attempt 2 of 2
+            db.finish_objective_event(
+                conn2, claimed2["id"], runtime_id="test-runtime",
+                status="completed",
+            )
+
+            current = db.get_objective(conn2, obj_id)
+            assert current.status == "abandoned"  # terminal, never completed
+            assert db.blocked_replan_attempts(conn2, obj_id) == 0  # reset
+            # Correction vs. the planned snippet: only ONE replan event was
+            # ever enqueued (attempt 2 abandons rather than scheduling a
+            # third lifecycle) — assert the real durable-inbox shape.
+            total = conn2.execute(
+                "SELECT COUNT(*) AS n FROM objective_inbox WHERE "
+                "objective_id=? AND event_type='objective.replan'",
+                (obj_id,),
+            ).fetchone()
+            assert total["n"] == 1
+            # Both audit lifecycles survive the restart as durable evidence.
+            audits = conn2.execute(
+                "SELECT event_type, COUNT(*) AS n FROM business_audit_events "
+                "WHERE objective_id=? AND event_type IN "
+                "('objective.autonomous_replan','objective.autonomous_abandon') "
+                "GROUP BY event_type",
+                (obj_id,),
+            ).fetchall()
+            counts = {r["event_type"]: r["n"] for r in audits}
+            assert counts == {
+                "objective.autonomous_replan": 1,
+                "objective.autonomous_abandon": 1,
+            }
