@@ -136,3 +136,15 @@ state suite 259/259; security+contract+kanban+coding+goals+wiring sweep 182/182.
 
 Remaining follow-on: browser-layer decomposition (gate 4), dotenv/multiplex
 lifecycle (gate 5), branding pass, then autonomy enhancements.
+
+## Gate 4 Status: COMPLETE (2026-09-06, commit 130e82c029)
+
+Ported the governed-browser authority (fork IP: exact per-operation permits
+bound to session + navigation permits bound to URL hash) onto upstream's
+browser decomposition. Adopted the browser_tool.py coordinator (1,365 lines,
+replacing the fork's pre-split monolith; only fork IP = the 3 security
+commits, all ported) + browser_camofox upstream snapshot.
+
+Exit evidence: governed-authorization + private-page guard + console-window
+32/32 (long-standing console failures resolved); browser_camofox 87/87;
+regression sweep 124/124.
