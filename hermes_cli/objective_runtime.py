@@ -437,7 +437,7 @@ class ObjectiveRuntime:
         category: str,
         reason: str,
         context: Mapping[str, Any],
-        options: list,
+        options: list[Mapping[str, Any]],
         advise_status: str = "blocked",
         advise_reason: Optional[str] = None,
     ) -> CycleOutcome:
@@ -488,9 +488,48 @@ class ObjectiveRuntime:
                 advise_reason if advise_reason is not None else reason,
             )
 
+        current_status = db.get_objective(
+            self.conn, objective_id
+        ).status
+        try:
+            if current_status != "planned":
+                db.transition_objective(
+                    self.conn, objective_id, "planned",
+                    actor=self.runtime_id,
+                    reason=f"autonomous replan: {reason}",
+                )
+        except Exception:
+            # Illegal source state (e.g. authorized/completed): do not burn
+            # replan budget on a transition the state machine forbids —
+            # fall back to the advisor handoff, which handles these states
+            # via the legacy blocked transition.
+            self._raise_advisor_handoff(
+                objective_id=objective_id,
+                category=category,
+                summary=reason,
+                context=context,
+                options=options,
+            )
+            if db.get_objective(self.conn, objective_id).status != "blocked":
+                db.transition_objective(
+                    self.conn, objective_id, "blocked",
+                    actor=self.runtime_id, reason=reason,
+                )
+            return CycleOutcome(event_id, objective_id, "blocked", reason)
+
         attempts = db.record_blocked_replan(self.conn, objective_id)
         max_attempts = int(policy.get("max_replan_attempts", 3))
         backoff = int(policy.get("replan_backoff_seconds", 60))
+        audit_payload = {
+            "attempt": attempts, "max": max_attempts,
+            "category": category, "reason": reason,
+            "policy_mode": mode,
+            "abandon_after_max": bool(policy.get("abandon_after_max", True)),
+            "policy_version": self.policy_version,
+        }
+        for evidence_key in ("plan_id", "verification_id", "verdict"):
+            if evidence_key in context and context[evidence_key]:
+                audit_payload[evidence_key] = context[evidence_key]
         if attempts < max_attempts:
             db.enqueue_objective_event(
                 self.conn,
@@ -499,24 +538,17 @@ class ObjectiveRuntime:
                 payload={"category": category, "reason": reason,
                          "attempt": attempts},
                 available_at=int(time.time()) + backoff,
-                dedupe_key=f"replan:{objective_id}:{attempts}",
+                dedupe_key=(
+                    f"replan:{objective_id}:{self.policy_version}:{attempts}"
+                ),
             )
-            if db.get_objective(self.conn, objective_id).status != "planned":
-                db.transition_objective(
-                    self.conn, objective_id, "planned",
-                    actor=self.runtime_id,
-                    reason=(
-                        f"autonomous replan {attempts}/{max_attempts}: {reason}"
-                    ),
-                )
             objective = db.get_objective(self.conn, objective_id)
             business_audit.append(
                 self.conn,
                 organization_id=objective.organization_id,
                 event_type="objective.autonomous_replan",
                 objective_id=objective_id,
-                payload={"attempt": attempts, "max": max_attempts,
-                         "category": category, "reason": reason},
+                payload=audit_payload,
             )
             return CycleOutcome(
                 event_id, objective_id, "replan_scheduled", reason
@@ -543,17 +575,16 @@ class ObjectiveRuntime:
                 organization_id=objective.organization_id,
                 event_type="objective.autonomous_abandon",
                 objective_id=objective_id,
-                payload={"attempts": attempts, "category": category,
-                         "reason": reason},
+                payload=audit_payload,
             )
             return CycleOutcome(event_id, objective_id, "abandoned", reason)
-        context = dict(context)
-        context["replan_attempts"] = attempts
+        enriched = dict(context)
+        enriched["replan_attempts"] = attempts
         self._raise_advisor_handoff(
             objective_id=objective_id,
             category=category,
             summary=reason,
-            context=context,
+            context=enriched,
             options=options,
         )
         if db.get_objective(self.conn, objective_id).status != "blocked":

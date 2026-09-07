@@ -476,3 +476,109 @@ class TestAutonomousReplan:
         assert len(
             _open_interventions(conn, obj.id, "no_admissible_action")
         ) == 1
+
+    # Adaptation vs. the planned test: the verify branch persists its verdict
+    # via record_verification, whose evidence contract requires a canonical
+    # envelope — so the stub verifier emits one via verification_evidence.build
+    # (no monkeypatches needed; verdict/evidence are orthogonal).
+    def test_evidence_insufficient_replans_autonomously(
+        self, conn, autonomous_charter
+    ):
+        """Path A: the verification-failure branch also replans under policy,
+        with plan_id/verification_id evidence in the audit payload."""
+        from hermes_cli import objectives_db as db
+        from hermes_cli import verification_evidence
+        from hermes_cli.objective_runtime import PlanProposal, VerificationOutcome
+
+        class _CompletablePlanner(_NoActionPlanner):
+            def propose(self, snapshot, event):
+                return PlanProposal(
+                    assumptions=[], tasks=["prove"], dependencies=[],
+                    risks=[], actions=[],
+                    objective_complete_when_verified=True,
+                )
+
+        class _ContractFailingVerifier(_FailingVerifier):
+            def verify_objective(self, snapshot, proposal, results):
+                evidence = verification_evidence.build(
+                    observer=self.identity,
+                    source_kind="deterministic_check",
+                    source_reference="stub://success-criteria",
+                    facts={"satisfied": False},
+                )
+                return VerificationOutcome("fail", evidence)
+
+        obj = _accepted_objective_with_event(conn)
+        rt = _make_runtime(conn, autonomous_charter)
+        rt.planner = _CompletablePlanner()
+        rt.verifier = _ContractFailingVerifier()
+        claimed = _claim_one(conn)
+        assert claimed is not None
+        rt._run_claimed_event(claimed)
+
+        current = db.get_objective(conn, obj.id)
+        assert current.status == "planned"
+        assert db.blocked_replan_attempts(conn, obj.id) == 1
+        replans = _pending_replans(conn, obj.id)
+        assert len(replans) == 1
+        assert replans[0]["payload_json"] is not None
+        audits = conn.execute(
+            "SELECT payload_json FROM business_audit_events WHERE "
+            "objective_id=? AND event_type='objective.autonomous_replan'",
+            (obj.id,),
+        ).fetchall()
+        assert len(audits) == 1
+        payload = json.loads(audits[0]["payload_json"])
+        assert payload["policy_mode"] == "autonomous"
+        assert payload["policy_version"] == "test-v1"
+
+    def test_human_only_category_via_helper_falls_back(
+        self, conn, autonomous_charter
+    ):
+        """The _HUMAN_ONLY_BLOCKED_CATEGORIES gate itself: a human-only
+        category passed to the helper must raise the advisor handoff and
+        never consume the counter — even in autonomous mode."""
+        from hermes_cli import objectives_db as db
+
+        obj = _accepted_objective_with_event(conn)
+        rt = _make_runtime(conn, autonomous_charter)
+        outcome = rt._resolve_blocked_outcome(
+            event_id="evt-test",
+            objective_id=obj.id,
+            category="resource_budget_exhausted",
+            reason="budget exhausted",
+            context={"plan_id": "plan-x"},
+            options=[{"id": "abandon", "label": "Abandon objective"}],
+        )
+        assert outcome.status == "blocked"
+        assert db.blocked_replan_attempts(conn, obj.id) == 0
+        assert len(
+            _open_interventions(conn, obj.id, "resource_budget_exhausted")
+        ) == 1
+
+    # Adaptation vs. the planned test: "authorized" is only reachable from
+    # "planned" (_TRANSITIONS); accepted→authorized raises ObjectiveStateError.
+    def test_illegal_transition_does_not_burn_budget(
+        self, conn, autonomous_charter
+    ):
+        """I1 regression: when the objective sits in a state whose
+        planned-transition is illegal (authorized), the helper falls back to
+        the advisor path WITHOUT consuming replan budget."""
+        from hermes_cli import objectives_db as db
+
+        obj = _accepted_objective_with_event(conn)
+        db.transition_objective(conn, obj.id, "planned", actor="test")
+        db.transition_objective(conn, obj.id, "authorized", actor="test")
+        rt = _make_runtime(conn, autonomous_charter)
+        outcome = rt._resolve_blocked_outcome(
+            event_id="evt-test",
+            objective_id=obj.id,
+            category="no_admissible_action",
+            reason="planner found no admissible next action",
+            context={"plan_id": "plan-x"},
+            options=[{"id": "advise", "label": "Provide bounded advisory guidance"}],
+        )
+        assert outcome.status == "blocked"
+        assert db.blocked_replan_attempts(conn, obj.id) == 0
+        # The advisor fallback transitioned authorized→blocked (legal).
+        assert db.get_objective(conn, obj.id).status == "blocked"
