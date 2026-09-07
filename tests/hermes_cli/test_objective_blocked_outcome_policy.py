@@ -1,8 +1,6 @@
 """Autonomous blocked-outcome policy: charter contract + runtime behavior.
 
-The approved boundary: blocked work is durably deferred, replanned, or
-abandoned per policy — never reported successful; security/integrity/budget
-blockers always require human resolution; operator stops always win.
+This module pins the charter contract; runtime application tests are added by later tasks in the same plan.
 """
 from __future__ import annotations
 
@@ -74,3 +72,41 @@ class TestCharterValidation:
                     "abandon_after_max": "yes",
                 })
             )
+
+    def test_attempts_upper_bound_pinned(self):
+        objective_policy.validate_charter(
+            _charter(blocked_outcome_policy={
+                "mode": "autonomous", "max_replan_attempts": 25
+            })
+        )
+        with pytest.raises(ValueError, match="max_replan_attempts"):
+            objective_policy.validate_charter(
+                _charter(blocked_outcome_policy={
+                    "mode": "autonomous", "max_replan_attempts": 26
+                })
+            )
+
+    def test_non_int_attempts_rejected(self):
+        for bad in ("3", 2.5):
+            with pytest.raises(ValueError, match="max_replan_attempts"):
+                objective_policy.validate_charter(
+                    _charter(blocked_outcome_policy={
+                        "mode": "autonomous", "max_replan_attempts": bad
+                    })
+                )
+
+    def test_non_int_backoff_rejected(self):
+        for bad in ("60", 45.5, [10]):
+            with pytest.raises(ValueError, match="replan_backoff_seconds"):
+                objective_policy.validate_charter(
+                    _charter(blocked_outcome_policy={
+                        "mode": "autonomous",
+                        "max_replan_attempts": 1,
+                        "replan_backoff_seconds": bad,
+                    })
+                )
+
+    def test_mode_whitespace_is_coerced(self):
+        objective_policy.validate_charter(
+            _charter(blocked_outcome_policy={"mode": "  autonomous  "})
+        )
