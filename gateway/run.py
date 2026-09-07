@@ -3083,6 +3083,7 @@ from gateway.session_state import (
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.objective_watcher import GatewayObjectiveWatcherMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
@@ -7371,7 +7372,12 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayKanbanWatchersMixin,
+    GatewayObjectiveWatcherMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -14606,6 +14612,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
         self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
+
+        # Governed objective runtime — wakes on durable events, proposes through
+        # the auxiliary planner, authorizes from the setup charter, and routes
+        # delegation into the existing Kanban worker kernel.
+        self._spawn_supervised(self._objective_runtime_watcher, "objective_runtime_watcher")
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:

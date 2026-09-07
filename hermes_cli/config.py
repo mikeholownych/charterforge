@@ -1139,6 +1139,53 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+        "run_budget_seconds": None,
+        "gateway_turn_lease_timeout": 5,
+        "agent_cache": {
+            # LRU entry cap.
+            "max_size": 128,
+            # Evict an agent that has been idle this long (seconds).
+            "idle_ttl_secs": 3600,
+            # Anonymous-RSS budget (MB) above which the gateway starts shedding
+            # least-recently-used transcripts, which reload from the persisted
+            # session on the next turn. "auto" derives the budget from the
+            # cgroup memory limit the gateway runs under (or total RAM when
+            # uncapped); a number sets it explicitly; 0/off disables the pass
+            # and lets memory grow to whatever the two bounds above allow.
+            "memory_high_mb": "auto",
+            # Upper bound on how many sessions one pressure pass sheds, so a
+            # burst of teardowns cannot stall the gateway.
+            "max_evictions_per_pass": 16,
+            # Most-recently-used sessions the pressure pass never touches —
+            # they are the ones actively paying for a warm prompt cache.
+            "protect_recent": 8,
+        },
+        "cron_drain_timeout": 30,
+        "restart_after_turn_timeout": 1800,
+        "empty_response_guard": {
+            # Master switch for both guards below. False restores the
+            # legacy fixed 3-retry behaviour unconditionally.
+            "enabled": True,
+            # When the estimated input cost of a single empty attempt
+            # meets or exceeds this many USD, the retry budget for the
+            # streak drops from 3 to 1. Unknown pricing or missing usage
+            # leaves the budget untouched.
+            "cost_threshold_usd": 0.25,
+        },
+        "fast_auto_seconds": 60,
+        "execution_guidance": "auto",
+        "stall_guards": True,
+        "bot_mode_protocol": True,
+        "session_stall_timeout": 300,
+        "sanitizer_heal_escalation_threshold": 3,
+        "reconnect_attention_after": 7200,
+        "gateway_startup_restore_drain_timeout": 30,
+        "gateway_startup_warmup_timeout": 20,
+        "reasoning_echo": False,
+        "turn_liveness": {
+            "timeout_s": 600.0,
+            "poll_s": 15.0,
+        },
     },
 
     "terminal": {
@@ -3021,6 +3068,13 @@ DEFAULT_CONFIG = {
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
+        "allow_data_training_tiers_noninteractive": False,
+        "approval": {
+            "transport": "builtin",
+            "transport_fallback": "deny",
+        },
+        "protected_instruction_files": True,
+        "protected_instruction_extra_patterns": [],
     },
 
     "cron": {
@@ -3090,6 +3144,21 @@ DEFAULT_CONFIG = {
         # wedges the job's dispatch guard forever. Also overridable via
         # HERMES_CRON_SESSION_DB_TIMEOUT env var. 0 = unlimited (skip the bound).
         "session_db_timeout_seconds": 10,
+        "allow_agent_scheduling": False,
+        "preflight": True,
+        "model_drift_guard": True,
+        "model": "",
+        "model_provider": "",
+        "delivery": {
+            # Mark cron deliveries as FINAL notifications so the platform pushes
+            # them (Telegram's "important" notification mode otherwise sends
+            # every non-notify message with disable_notification=True, and users
+            # report the silent brief as "never delivered"). Set to false to
+            # restore silent (no-push) cron deliveries.
+            "notify": True,
+        },
+        "script_timeout_seconds": 3600,
+        "media_send_timeout_seconds": 300,
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that
@@ -3385,6 +3454,14 @@ DEFAULT_CONFIG = {
             # request flood. Set to 0 to disable the cap entirely.
             "max_concurrent_runs": 10,
         },
+        "multiplex_profile_allowlist": None,
+        "signal_interrupt_grace_timeout": 1,
+        "loop_watchdog_probe_interval_s": 30.0,
+        "loop_watchdog_probe_timeout_s": 10.0,
+        "loop_watchdog_max_strikes": 3,
+        "startup_watchdog": True,
+        "startup_watchdog_timeout_seconds": 300,
+        "trust_env": True,
     },
 
     # Real-time token streaming to messaging platforms (Telegram, Discord,
@@ -7498,6 +7575,20 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
         node = node[key]
     return node
 
+
+
+def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read a user ``config.yaml`` EXACTLY as written (no defaults/overlay/expansion, no cache).
+    ONLY legal for write-back round-trips and raw-file diagnostics — behavioral reads must use
+    load_config()/load_config_readonly()."""
+    if config_path is None:
+        config_path = get_config_path()
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = fast_safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def read_raw_config() -> Dict[str, Any]:
