@@ -806,3 +806,28 @@ Expected: pass (new prompt defaults must not break existing fixtures).
 git add hermes_cli/setup.py website/docs/guides/agentic-business-os.md
 git commit -m "docs+setup: expose blocked_outcome_policy in agentic charter"
 ```
+
+## Status: COMPLETE (2026-09-06)
+
+Commits a31172e41b..8c90684eac. Final review verdict READY — 106/106 across
+policy (28), runtime (27), db (15), service+worker (26), policy-suite (10).
+Governance contract traced on the riskiest lines: human-only gate ordering
+(counter untouched for spend/authority/security + non-autonomous mode),
+operating-mode fail-closed operand (defense-in-depth with per-tick
+assert_autonomous + charter re-read), terminal-abandon path (state-machine
+legal, audited with evidence, counter reset in-transaction).
+
+Follow-ups (non-blocking):
+1. Third evidence_insufficient path + action_evidence_insufficient sites:
+   resolve action_id dedupe semantics before routing (autonomous handoffs
+   dedupe per-objective; legacy per-action).
+2. Advise-mode intervention prose deltas (state-invariant, audit-visible) —
+   sign-off recorded; restore legacy strings via advise_summary params if
+   strict byte-identity is ever required.
+3. max_replan_attempts naming consumes N blocks → N-1 replans + abandon;
+   consider rename max_blocked_cycles.
+4. bool-vs-int validation idiom (file-wide); reject bools in one pass.
+5. Crash window: increment+enqueue not atomic (burns one attempt, fails
+   conservative).
+6. Pre-existing test_setup_agentic canned-stream misalignment — separate
+   ticket.
