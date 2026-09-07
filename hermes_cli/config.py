@@ -7577,6 +7577,12 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 
+# Re-exports — :mod:`hermes_cli.config_providers` owns custom-provider parsing.
+from hermes_cli.config_providers import (  # noqa: E402,F401
+    coerce_provider_id,
+    find_provider_entry,
+)
+
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written (no defaults/overlay/expansion, no cache).
     ONLY legal for write-back round-trips and raw-file diagnostics — behavioral reads must use
@@ -9905,3 +9911,67 @@ def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
     """Whether the remote SSH shell must expand *cwd* itself: ``~`` expanded on the Hermes host
     would name the host/container home instead of the SSH user's."""
     return (backend or "").strip().lower() == "ssh" and (cwd == "~" or cwd.startswith("~/"))
+
+
+# ---- Extracted from upstream (cron model impact + nix install) ----
+
+def is_nix_install_method(method: str) -> bool:
+    """True for every install method Nix owns ("nix", "nixos", "home-manager")."""
+    return method == "nix" or method in _NIX_MANAGED_SYSTEMS
+
+
+def _cron_model_impact_result(available: bool, guard_enabled: bool) -> Dict[str, Any]:
+    return {
+        "available": available,
+        "guard_enabled": guard_enabled,
+        "affected_count": 0,
+        "truncated": False,
+        "jobs": []}
+
+
+def build_cron_model_impact(
+    *, current_provider: Any = "", current_model: Any = "", config: Any = None, jobs: Any = None
+) -> Dict[str, Any]:
+    """Build a bounded, profile-local summary of jobs blocked by model drift.
+    Job-store inspection is best effort: the model assignment has already succeeded when Desktop
+    requests this, so an unreadable store is reported as unavailable rather than failing."""
+    guard_enabled = cron_model_drift_guard_enabled(config)
+    if jobs is None:
+        try:
+            from cron.jobs import load_jobs
+
+            jobs = load_jobs()
+        except Exception:
+            return _cron_model_impact_result(False, guard_enabled)
+    if not isinstance(jobs, list):
+        return _cron_model_impact_result(False, guard_enabled)
+
+    result = _cron_model_impact_result(True, guard_enabled)
+    if not guard_enabled:
+        return result
+
+    from cron.jobs import is_job_runnable
+
+    seen_ids: Set[str] = set()
+    for job in jobs:
+        if not isinstance(job, dict) or not is_job_runnable(job) or job.get("no_agent"):
+            continue
+        job_id = _valid_cron_impact_job_id(job.get("id"))
+        if not job_id or job_id in seen_ids:
+            continue
+        seen_ids.add(job_id)
+        axes = cron_model_drift_axes(
+            job, current_provider=current_provider, current_model=current_model, config=config)
+        if not axes:
+            continue
+        result["affected_count"] += 1
+        if len(result["jobs"]) < _CRON_MODEL_IMPACT_JOB_LIMIT:
+            result["jobs"].append({
+                "id": job_id,
+                "name": _cron_impact_job_name(job.get("name"), job_id),
+                "drifted_axes": axes})
+
+    result["truncated"] = result["affected_count"] > len(result["jobs"])
+    return result
+
+

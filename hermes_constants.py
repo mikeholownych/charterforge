@@ -1300,3 +1300,73 @@ FINISH_REASON_LENGTH = "length"
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
+
+
+# ---- Extracted from upstream (managed Node bootstrap helpers) ----
+
+def managed_node_tree_in_use(home: Path | None = None) -> bool:
+    """True when a running process executes from the managed Node tree.
+
+    Windows locks running executables against delete/overwrite, so the updater must not rewrite
+    ``%HERMES_HOME%\\node`` while the desktop app holds it (``[WinError 5]`` on ``npm.cmd``).
+
+    Always ``False`` on POSIX, which has no equivalent lock semantics. See #80926.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import psutil
+    except Exception:
+        return False
+    dirs: list[str] = []
+    for directory in iter_hermes_node_dirs(home):
+        try:
+            dirs.append(str(Path(directory).resolve()))
+        except OSError:
+            continue
+    if not dirs:
+        return False
+    try:
+        procs = psutil.process_iter(["exe", "cmdline"])
+    except Exception:
+        return False
+    for proc in procs:
+        try:
+            info = proc.info
+        except Exception:
+            continue
+        exe = info.get("exe")
+        if exe:
+            try:
+                exe = str(Path(exe).resolve())
+            except (OSError, ValueError):
+                exe = str(exe)
+        if any(_path_under_any(p, dirs) for p in ([exe] if exe else []) + list(info.get("cmdline") or [])):
+            return True
+    return False
+
+
+def bootstrap_hermes_managed_node() -> str | None:
+    """Install a Hermes-managed Node tree under ``$HERMES_HOME/node`` and return its npm path.
+
+    Hermes never modifies a user-owned toolchain (system, nvm, brew, Nix) that fails ``engines``.
+    """
+    existing = find_hermes_node_executable("npm")
+    if existing:
+        return existing
+    if sys.platform == "win32":
+        ok = _heal_managed_node_windows()
+    else:
+        # HERMES_NODE_SKIP_LINKS=1 keeps node/npm/npx out of ~/.local/bin: never shadow the user toolchain.
+        ok = _run_node_bootstrap("_nb_install_bundled_node", timeout=600, HERMES_NODE_SKIP_LINKS="1")
+    if not ok:
+        return None
+    return _first_runnable_managed(_candidate_node_command_names("npm"))[0]
+
+
+def venv_python_path(venv_dir, *, windows: bool | None = None) -> Path:
+    """Path to the Python interpreter inside *venv_dir* (may not exist)."""
+    bin_dir = venv_bin_dir(venv_dir, windows=windows)
+    return bin_dir / ("python.exe" if bin_dir.name == "Scripts" else "python")
+
+
