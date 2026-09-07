@@ -418,6 +418,151 @@ class ObjectiveRuntime:
             ),
         )
 
+    # Blocked categories that are NEVER autonomously resolvable. These demand
+    # human resolution by design (spend, authority contract, security
+    # posture) — a charter policy cannot override them.
+    _HUMAN_ONLY_BLOCKED_CATEGORIES = frozenset(
+        {
+            "resource_budget_exhausted",
+            "planner_contract_violation",
+            "executor_authority_rejected",
+        }
+    )
+
+    def _resolve_blocked_outcome(
+        self,
+        *,
+        event_id: str,
+        objective_id: str,
+        category: str,
+        reason: str,
+        context: Mapping[str, Any],
+        options: list,
+        advise_status: str = "blocked",
+        advise_reason: Optional[str] = None,
+    ) -> CycleOutcome:
+        """Apply the charter's blocked_outcome_policy to one blocked outcome.
+
+        advise (default): raise the advisor handoff and leave the objective
+        blocked — identical to the pre-policy behavior.
+
+        autonomous: for replannable categories, schedule a durable
+        objective.replan event with backoff and transition the objective back
+        to "planned" so the next cycle replans with the blocked evidence in
+        its snapshot. When the attempt budget is exhausted: transition to
+        "abandoned" (terminal, audit recorded) — never "completed" or
+        "verified". abandon_after_max=False keeps the objective blocked and
+        demands human resolution instead.
+
+        Human-only categories and non-autonomous operating modes always fall
+        back to the advisor handoff: operator stops and spend/authority/
+        security boundaries outrank the policy.
+
+        ``advise_status``/``advise_reason`` let a caller preserve its exact
+        legacy fallback CycleOutcome (e.g. "escalated" for the
+        no-admissible-action branch) while sharing the same governance flow.
+        """
+        policy = self.charter.get("blocked_outcome_policy") or {}
+        mode = str(policy.get("mode", "advise"))
+        if (
+            mode != "autonomous"
+            or category in self._HUMAN_ONLY_BLOCKED_CATEGORIES
+            or str(self.charter.get("operating_mode", "")) != "autonomous"
+        ):
+            self._raise_advisor_handoff(
+                objective_id=objective_id,
+                category=category,
+                summary=reason,
+                context=context,
+                options=options,
+            )
+            if db.get_objective(self.conn, objective_id).status != "blocked":
+                db.transition_objective(
+                    self.conn, objective_id, "blocked",
+                    actor=self.runtime_id, reason=reason,
+                )
+            return CycleOutcome(
+                event_id,
+                objective_id,
+                advise_status,
+                advise_reason if advise_reason is not None else reason,
+            )
+
+        attempts = db.record_blocked_replan(self.conn, objective_id)
+        max_attempts = int(policy.get("max_replan_attempts", 3))
+        backoff = int(policy.get("replan_backoff_seconds", 60))
+        if attempts < max_attempts:
+            db.enqueue_objective_event(
+                self.conn,
+                objective_id=objective_id,
+                event_type="objective.replan",
+                payload={"category": category, "reason": reason,
+                         "attempt": attempts},
+                available_at=int(time.time()) + backoff,
+                dedupe_key=f"replan:{objective_id}:{attempts}",
+            )
+            if db.get_objective(self.conn, objective_id).status != "planned":
+                db.transition_objective(
+                    self.conn, objective_id, "planned",
+                    actor=self.runtime_id,
+                    reason=(
+                        f"autonomous replan {attempts}/{max_attempts}: {reason}"
+                    ),
+                )
+            objective = db.get_objective(self.conn, objective_id)
+            business_audit.append(
+                self.conn,
+                organization_id=objective.organization_id,
+                event_type="objective.autonomous_replan",
+                objective_id=objective_id,
+                payload={"attempt": attempts, "max": max_attempts,
+                         "category": category, "reason": reason},
+            )
+            return CycleOutcome(
+                event_id, objective_id, "replan_scheduled", reason
+            )
+        if bool(policy.get("abandon_after_max", True)):
+            # The state machine only permits abandonment from "blocked" (the
+            # same state the advisor path abandons from), so route through it.
+            if db.get_objective(self.conn, objective_id).status != "blocked":
+                db.transition_objective(
+                    self.conn, objective_id, "blocked",
+                    actor=self.runtime_id, reason=reason,
+                )
+            db.transition_objective(
+                self.conn, objective_id, "abandoned",
+                actor=self.runtime_id,
+                reason=(
+                    f"replan budget exhausted after {attempts} attempts: "
+                    f"{reason}"
+                ),
+            )
+            objective = db.get_objective(self.conn, objective_id)
+            business_audit.append(
+                self.conn,
+                organization_id=objective.organization_id,
+                event_type="objective.autonomous_abandon",
+                objective_id=objective_id,
+                payload={"attempts": attempts, "category": category,
+                         "reason": reason},
+            )
+            return CycleOutcome(event_id, objective_id, "abandoned", reason)
+        context = dict(context)
+        context["replan_attempts"] = attempts
+        self._raise_advisor_handoff(
+            objective_id=objective_id,
+            category=category,
+            summary=reason,
+            context=context,
+            options=options,
+        )
+        if db.get_objective(self.conn, objective_id).status != "blocked":
+            db.transition_objective(
+                self.conn, objective_id, "blocked",
+                actor=self.runtime_id, reason=reason,
+            )
+        return CycleOutcome(event_id, objective_id, "blocked", reason)
+
     def _preserve_business_continuity(
         self,
         *,
@@ -1452,10 +1597,11 @@ class ObjectiveRuntime:
                     "verified",
                     "existing external state satisfies objective success criteria",
                 )
-            self._raise_advisor_handoff(
+            return self._resolve_blocked_outcome(
+                event_id=str(event["id"]),
                 objective_id=objective_id,
                 category="objective_evidence_insufficient",
-                summary="Available evidence does not prove the objective complete",
+                reason=f"objective verification {objective_verification.verdict}",
                 context={
                     "plan_id": plan_id,
                     "verification_id": verification_id,
@@ -1467,44 +1613,21 @@ class ObjectiveRuntime:
                     {"id": "abandon", "label": "Abandon the objective"},
                 ],
             )
-            db.transition_objective(
-                self.conn,
-                objective_id,
-                "blocked",
-                actor=self.runtime_id,
-                reason=f"objective verification {objective_verification.verdict}",
-            )
-            return CycleOutcome(
-                str(event["id"]),
-                objective_id,
-                "blocked",
-                f"objective verification {objective_verification.verdict}",
-            )
 
         if not proposal.actions:
-            self._raise_advisor_handoff(
+            return self._resolve_blocked_outcome(
+                event_id=str(event["id"]),
                 objective_id=objective_id,
                 category="no_admissible_action",
-                summary="Planner found no admissible next action",
+                reason="planner found no admissible next action",
                 context={"plan_id": plan_id, "tasks": proposal.tasks},
                 options=[
                     {"id": "advise", "label": "Provide bounded advisory guidance"},
                     {"id": "expand_authority", "label": "Change the standing charter"},
                     {"id": "abandon", "label": "Abandon the objective"},
                 ],
-            )
-            db.transition_objective(
-                self.conn,
-                objective_id,
-                "blocked",
-                actor=self.runtime_id,
-                reason="planner proposed no admissible next action",
-            )
-            return CycleOutcome(
-                str(event["id"]),
-                objective_id,
-                "escalated",
-                "planner proposed no next action",
+                advise_status="escalated",
+                advise_reason="planner proposed no next action",
             )
 
         action_ids: list[str] = []

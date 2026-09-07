@@ -114,13 +114,17 @@ class TestCharterValidation:
 
 # Adaptation vs. the planned fixture: objectives_db.connect() resolves its
 # path arg (":memory:" would become a literal <cwd>/:memory: file), so the
-# store is opened against a per-test tmp_path instead.
+# store is opened against a per-test tmp_path instead. operational_control's
+# schema is ensured up front so tests that legitimately raise no intervention
+# (autonomous replan) can still assert on the empty intervention_queue table.
 @pytest.fixture()
 def conn(tmp_path):
     from hermes_cli import objectives_db
+    from hermes_cli import operational_control
 
     conn = objectives_db.connect(tmp_path / "objectives.db")
     conn.row_factory = sqlite3.Row
+    operational_control.ensure_schema(conn)
     return conn
 
 
@@ -253,3 +257,222 @@ class TestReplanCounter:
                 "SELECT blocked_replan_attempts FROM objectives WHERE id='obj-legacy'"
             ).fetchone()
             assert row["blocked_replan_attempts"] == 0
+
+
+# ── Runtime policy application (Task 3) ────────────────────────────────────
+
+
+class _NoActionPlanner:
+    identity = "stub-planner"
+
+    def propose(self, snapshot, event):
+        from hermes_cli.objective_runtime import PlanProposal
+
+        return PlanProposal(
+            assumptions=[], tasks=["await guidance"], dependencies=[],
+            risks=[], actions=[], objective_complete_when_verified=False,
+        )
+
+
+class _PassThroughExecutor:
+    identity = "stub-executor"
+
+    def execute(self, action, context):  # pragma: no cover - never reached
+        raise AssertionError("no execution expected")
+
+
+class _FailingVerifier:
+    identity = "stub-verifier"
+
+    def verify(self, action, result):  # pragma: no cover - never reached
+        raise AssertionError("no action verification expected")
+
+    def verify_objective(self, snapshot, proposal, results):
+        from hermes_cli.objective_runtime import VerificationOutcome
+
+        return VerificationOutcome("fail", "evidence insufficient")
+
+
+def _make_runtime(conn, charter):
+    from hermes_cli.objective_runtime import ObjectiveRuntime
+
+    return ObjectiveRuntime(
+        conn, charter=charter, planner=_NoActionPlanner(),
+        executor=_PassThroughExecutor(), verifier=_FailingVerifier(),
+        policy_version="test-v1",
+    )
+
+
+@pytest.fixture()
+def autonomous_charter():
+    return _charter()  # from Task 1 helper: autonomous policy
+
+
+def _accepted_objective_with_event(conn):
+    from hermes_cli import objectives_db as db
+
+    obj = _make_objective(conn)
+    db.transition_objective(conn, obj.id, "accepted", actor="test")
+    db.enqueue_objective_event(
+        conn, objective_id=obj.id, event_type="ceo.operating_review",
+        payload={"source": "test"},
+    )
+    return obj
+
+
+def _claim_one(conn):
+    from hermes_cli import objectives_db as db
+
+    return db.claim_objective_event(conn, runtime_id="test-runtime")
+
+
+def _pending_replans(conn, objective_id):
+    return conn.execute(
+        "SELECT * FROM objective_inbox WHERE objective_id=? AND "
+        "event_type='objective.replan' AND status='pending' "
+        "ORDER BY created_at",
+        (objective_id,),
+    ).fetchall()
+
+
+def _open_interventions(conn, objective_id, category):
+    return conn.execute(
+        "SELECT * FROM intervention_queue WHERE objective_id=? AND "
+        "category=? AND status='open'",
+        (objective_id, category),
+    ).fetchall()
+
+
+class TestAutonomousReplan:
+    def test_no_admissible_action_replans_within_budget(
+        self, conn, autonomous_charter
+    ):
+        from hermes_cli import objectives_db as db
+
+        obj = _accepted_objective_with_event(conn)
+        rt = _make_runtime(conn, autonomous_charter)
+        claimed = _claim_one(conn)
+        assert claimed is not None
+        rt._run_claimed_event(claimed)
+
+        assert db.blocked_replan_attempts(conn, obj.id) == 1
+        current = db.get_objective(conn, obj.id)
+        assert current.status == "planned"  # replanned, not parked
+        replans = _pending_replans(conn, obj.id)
+        assert len(replans) == 1
+        assert _open_interventions(conn, obj.id, "no_admissible_action") == []
+        # audit trail recorded
+        audits = conn.execute(
+            "SELECT * FROM business_audit_events WHERE objective_id=? AND "
+            "event_type='objective.autonomous_replan'", (obj.id,)
+        ).fetchall()
+        assert len(audits) == 1
+
+    def test_replan_event_carries_backoff(self, conn, autonomous_charter):
+        import time as _time
+        from hermes_cli import objectives_db as db
+
+        obj = _accepted_objective_with_event(conn)
+        rt = _make_runtime(conn, autonomous_charter)
+        before = int(_time.time())
+        claimed = _claim_one(conn)
+        rt._run_claimed_event(claimed)
+        replan = _pending_replans(conn, obj.id)[0]
+        assert int(replan["available_at"]) >= before + 60  # charter backoff
+
+    def test_attempts_exhausted_abandons_objective(self, conn, autonomous_charter):
+        from hermes_cli import objectives_db as db
+
+        obj = _accepted_objective_with_event(conn)
+        # Burn the 2 allowed replans from the Task-1 charter.
+        db.record_blocked_replan(conn, obj.id)
+        db.record_blocked_replan(conn, obj.id)
+        rt = _make_runtime(conn, autonomous_charter)
+        claimed = _claim_one(conn)
+        rt._run_claimed_event(claimed)
+
+        current = db.get_objective(conn, obj.id)
+        assert current.status == "abandoned"  # terminal, NEVER completed/verified
+        assert db.blocked_replan_attempts(conn, obj.id) == 0  # reset on terminal
+        audits = conn.execute(
+            "SELECT * FROM business_audit_events WHERE objective_id=? AND "
+            "event_type='objective.autonomous_abandon'", (obj.id,)
+        ).fetchall()
+        assert len(audits) == 1
+
+    def test_budget_category_never_autonomously_resolved(
+        self, conn, autonomous_charter, monkeypatch
+    ):
+        from hermes_cli import objectives_db as db
+        from hermes_cli import resource_budget
+
+        obj = _accepted_objective_with_event(conn)
+
+        def explode(*a, **k):
+            raise resource_budget.ResourceBudgetError(
+                "objective budget exhausted"
+            )
+
+        monkeypatch.setattr(resource_budget, "assert_admissible", explode)
+        rt = _make_runtime(conn, autonomous_charter)
+        claimed = _claim_one(conn)
+        rt._run_claimed_event(claimed)
+
+        current = db.get_objective(conn, obj.id)
+        assert current.status == "blocked"
+        assert db.blocked_replan_attempts(conn, obj.id) == 0  # human-only: no counter
+        assert len(
+            _open_interventions(conn, obj.id, "resource_budget_exhausted")
+        ) == 1
+
+    def test_advise_mode_is_legacy_identical(self, conn):
+        from hermes_cli import objectives_db as db
+
+        charter = _charter(blocked_outcome_policy={"mode": "advise"})
+        obj = _accepted_objective_with_event(conn)
+        rt = _make_runtime(conn, charter)
+        claimed = _claim_one(conn)
+        rt._run_claimed_event(claimed)
+
+        assert db.get_objective(conn, obj.id).status == "blocked"
+        assert db.blocked_replan_attempts(conn, obj.id) == 0
+        assert _pending_replans(conn, obj.id) == []
+        assert len(
+            _open_interventions(conn, obj.id, "no_admissible_action")
+        ) == 1  # advisor handoff as before
+
+    def test_operator_stop_wins_over_policy(self, conn, autonomous_charter):
+        """Supervised operating mode (operator pause) prevents autonomous
+        replanning even with an autonomous policy — stop controls win."""
+        from hermes_cli import objectives_db as db
+
+        charter = dict(autonomous_charter)
+        charter["operating_mode"] = "supervised"
+        obj = _accepted_objective_with_event(conn)
+        rt = _make_runtime(conn, charter)
+        claimed = _claim_one(conn)
+        rt._run_claimed_event(claimed)
+
+        assert db.get_objective(conn, obj.id).status == "blocked"
+        assert db.blocked_replan_attempts(conn, obj.id) == 0
+
+    def test_abandon_after_max_false_stays_blocked_and_demands_human(
+        self, conn, autonomous_charter
+    ):
+        from hermes_cli import objectives_db as db
+
+        charter = _charter(blocked_outcome_policy={
+            "mode": "autonomous", "max_replan_attempts": 1,
+            "abandon_after_max": False,
+        })
+        obj = _accepted_objective_with_event(conn)
+        db.record_blocked_replan(conn, obj.id)  # burn the single attempt
+        rt = _make_runtime(conn, charter)
+        claimed = _claim_one(conn)
+        rt._run_claimed_event(claimed)
+
+        current = db.get_objective(conn, obj.id)
+        assert current.status == "blocked"  # not abandoned
+        assert len(
+            _open_interventions(conn, obj.id, "no_admissible_action")
+        ) == 1
