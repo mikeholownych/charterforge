@@ -9717,5 +9717,100 @@ def _inject_platform_plugin_env_vars() -> None:
         pass
 
 
+# Back-compat re-exports — :mod:`hermes_cli.personality` owns personality/overlay semantics.
+from hermes_cli.personality import (  # noqa: E402,F401
+    NEUTRAL_PERSONALITY_NAMES as _NEUTRAL_PERSONALITY_NAMES,
+    prompt_text as _prompt_text,
+    render_personality_prompt,
+    resolve_ephemeral_system_prompt as resolve_ephemeral_system_prompt_from_config)
+
+
 # Eagerly inject so that platform plugin env vars show up in the setup wizard.
 _inject_platform_plugin_env_vars()
+
+
+# ---- Cron model-drift guard helpers (extracted from upstream) ----
+
+_CRON_DRIFT_AXIS_BY_KEY = {
+    "model": "model", "model.default": "model", "model.model": "model", "model.name": "model",
+    "model.provider": "provider", "provider": "provider"}
+
+
+def _cron_model_drift_axis_for_config_key(key: str) -> Optional[str]:
+    """Return the cron drift guard axis affected by a config key, if any."""
+    return _CRON_DRIFT_AXIS_BY_KEY.get(str(key or "").strip().lower())
+
+
+def _cron_section(config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return the ``cron`` mapping of *config* (loading the merged config when None), else None."""
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return None
+    cron_config = config.get("cron") if isinstance(config, dict) else None
+    return cron_config if isinstance(cron_config, dict) else None
+
+
+def cron_model_drift_guard_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether cron must fail closed on unpinned inference drift.
+    Only the literal YAML boolean ``false`` disables this spend-safety guard; missing, malformed,
+    or non-boolean values stay fail-closed. With *config* omitted the merged config is loaded so
+    CLI warnings honor the same user/managed setting as the scheduler."""
+    cron_config = _cron_section(config)
+    return cron_config is None or cron_config.get("model_drift_guard", True) is not False
+
+
+_CRON_MODEL_IMPACT_JOB_LIMIT = 50
+_CRON_MODEL_IMPACT_ID_LIMIT = 256
+_CRON_MODEL_IMPACT_NAME_LIMIT = 120
+
+
+def _model_assignment_text(value: Any) -> str:
+    """Return a trimmed scalar model/provider value, or empty for malformed data."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def resolve_cron_model_drift_defaults(
+    config: Any, *, environ: Optional[Dict[str, str]] = None) -> Tuple[str, str]:
+    """Resolve the global ``(provider, model)`` cron compares against snapshots.
+    Mirrors the scheduler's precedence: a truthy configured model wins over ``HERMES_MODEL``; the
+    environment is only a fallback. Per-job and cron fleet defaults are handled by the caller
+    because they suppress a drift axis rather than changing the global assignment."""
+    env = os.environ if environ is None else environ
+    provider = ""
+    model_config = config.get("model") if isinstance(config, dict) else None
+    if isinstance(model_config, dict):
+        provider = _model_assignment_text(model_config.get("provider"))
+        model_config = model_config.get("default") or model_config.get("model") or model_config.get("name")
+    configured_model = _model_assignment_text(model_config)
+    return provider, configured_model or _model_assignment_text(env.get("HERMES_MODEL", ""))
+
+
+def cron_model_drift_axes(
+    job: Any, *, current_provider: Any = "", current_model: Any = "", config: Any = None
+) -> List[str]:
+    """Return the unpinned axes that the fail-closed cron guard would block."""
+    if not isinstance(job, dict) or not cron_model_drift_guard_enabled(config):
+        return []
+
+    current = {
+        "provider": _model_assignment_text(current_provider).lower(),
+        "model": _model_assignment_text(current_model).lower()}
+    # A cron.model / cron.model_provider fleet default covers its axis: that axis no longer follows
+    # the global assignment at fire time, so the guard never engages and a warning would be false.
+    fleet = _cron_section(config) or {}
+    drifted: List[str] = []
+    for axis, fleet_key in (("provider", "model_provider"), ("model", "model")):
+        if _model_assignment_text(fleet.get(fleet_key)) or _model_assignment_text(job.get(axis)):
+            continue
+        snapshot = _model_assignment_text(job.get(f"{axis}_snapshot")).lower()
+        if snapshot and current[axis] and snapshot != current[axis]:
+            drifted.append(axis)
+    return drifted
+
+
+def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
+    """Whether the remote SSH shell must expand *cwd* itself: ``~`` expanded on the Hermes host
+    would name the host/container home instead of the SSH user's."""
+    return (backend or "").strip().lower() == "ssh" and (cwd == "~" or cwd.startswith("~/"))

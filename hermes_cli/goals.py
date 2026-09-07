@@ -29,9 +29,12 @@ Nothing in this module touches the agent's system prompt or toolset.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import json
 import logging
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -1780,6 +1783,32 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
         turns_used += 1
+
+
+from hermes_cli._subprocess_compat import noninteractive_git_env
+
+
+def workspace_fingerprint(cwd: Optional[str] = None) -> str:
+    """sha256 of ``git rev-parse HEAD`` + ``git status --porcelain``; "" outside git (never matches,
+    so gates always re-run — a safe fallback)."""
+    workdir = cwd or os.getcwd()
+    try:
+        outputs = []
+        for argv, timeout in (
+            (["git", "rev-parse", "HEAD"], 10),
+            (["git", "status", "--porcelain"], 30),
+        ):
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=timeout, cwd=workdir, stdin=subprocess.DEVNULL, env=noninteractive_git_env(),
+            )
+            if proc.returncode != 0:
+                return ""
+            outputs.append(proc.stdout)
+        blob = outputs[0].strip() + "\n" + outputs[1]
+        return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()
+    except Exception:
+        return ""
 
 
 __all__ = [

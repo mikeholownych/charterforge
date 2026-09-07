@@ -22,6 +22,12 @@ _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
 )
 
 
+# TUI busy-indicator styles (CLI /indicator, TUI gateway config, /help registry).
+# Keep in sync with INDICATOR_STYLES / DEFAULT_INDICATOR_STYLE in ui-tui/src/app/interfaces.ts.
+INDICATOR_STYLES: tuple[str, ...] = ("ascii", "emoji", "kaomoji", "unicode")
+DEFAULT_INDICATOR_STYLE: str = "kaomoji"
+
+
 def set_hermes_home_override(path: str | Path | None) -> Token:
     """Set a context-local Hermes home override and return its reset token.
 
@@ -144,6 +150,43 @@ def get_hermes_home() -> Path:
 def get_charterforge_home() -> Path:
     """Return the canonical Charterforge state directory."""
     return get_hermes_home()
+
+
+# ── Stable registry key for a Hermes home/profile dir (extracted from upstream) ──
+# syscall per lookup. A process only ever sees a handful of home paths, so
+# the dict stays tiny. Only paths that really exist are stored, see below.
+_HOME_KEY_CACHE: dict[str, str] = {}
+
+
+def hermes_home_key(path: str | Path | None = None) -> str:
+    """Stable registry key for a Hermes home/profile dir.
+
+    ``strict=False`` so profiles whose directories don't exist yet still get a key.
+
+    The resolved value is remembered per input path. A directory that does
+    not exist yet is resolved without touching the cache, because the answer
+    can change once it is created (e.g. part of the path turns out to be a symlink).
+    """
+    candidate = Path(path) if path is not None else get_hermes_home()
+    raw = str(candidate)
+    cached = _HOME_KEY_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    expanded = candidate.expanduser()
+    try:
+        resolved = expanded.resolve(strict=True)
+    except OSError:
+        # Not on disk yet: lenient resolve, not stored, so the real answer is
+        # picked up once the directory appears.
+        return os.path.normcase(str(expanded.resolve(strict=False)))
+    key = os.path.normcase(str(resolved))
+    _HOME_KEY_CACHE[raw] = key
+    return key
+
+
+def reset_hermes_home_key_cache() -> None:
+    """Forget every remembered home key (for tests that move a home dir on disk)."""
+    _HOME_KEY_CACHE.clear()
 
 
 def get_process_hermes_home() -> Path:

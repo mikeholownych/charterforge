@@ -21,6 +21,7 @@ import json
 import logging
 import sqlite3
 import re
+import copy
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -138,6 +139,7 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 _DB_PERSISTED_MARKER = "_db_persisted"
+MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
@@ -5524,3 +5526,144 @@ def is_compaction_summary_message(message: Any) -> bool:
     else:
         content = message
     return ContextCompressor._is_context_summary_content(content)
+
+
+# ── User-turn projection (extracted from upstream refactor; deps verified present) ──
+
+
+def _part_text(item: Any) -> Optional[str]:
+    """Text of a content part: the string itself, a dict's ``text``, else None."""
+    return item if isinstance(item, str) else item.get("text") if isinstance(item, dict) else None
+
+
+def _with_part_text(item: Any, text: str) -> Any:
+    """Copy of a content part carrying ``text`` (string parts become the text itself)."""
+    return {**item, "text": text} if isinstance(item, dict) else text
+
+
+SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS = ("reactions",)
+
+
+def _handoff_only_content(content: Any) -> Any:
+    """Project summary-bearing content to the synthetic handoff alone; never keeps live media."""
+    def _through_end_marker(text: str) -> str:
+        marker_idx = text.find(_SUMMARY_END_MARKER)
+        return text[: marker_idx + len(_SUMMARY_END_MARKER)] if marker_idx >= 0 else text
+
+    if isinstance(content, str):
+        if _MERGED_SUMMARY_DELIMITER in content:
+            content = content.split(_MERGED_SUMMARY_DELIMITER, 1)[1].lstrip()
+        return _through_end_marker(content)
+    if not isinstance(content, list):
+        return content
+    # Ordinary merge: summary suffix starts in the delimiter part; later parts may carry live media
+    # — never retain.
+    for item in content:
+        text = _part_text(item)
+        if not isinstance(text, str) or _MERGED_SUMMARY_DELIMITER not in text:
+            continue
+        suffix = _through_end_marker(text.split(_MERGED_SUMMARY_DELIMITER, 1)[1].lstrip())
+        return [_with_part_text(item, suffix)] if suffix else []
+
+    # Force-user-leading: keep parts through the end marker, truncated before the live ask.
+    projected: list[Any] = []
+    for item in content:
+        text = _part_text(item)
+        if not isinstance(text, str):
+            continue
+        if _SUMMARY_END_MARKER in text:
+            projected.append(_with_part_text(item, text.split(_SUMMARY_END_MARKER, 1)[0] + _SUMMARY_END_MARKER))
+            return projected
+        projected.append(item.copy() if isinstance(item, dict) else item)
+    return projected
+
+
+def split_user_originated_turn(message: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Split a user row into ``(handoff_only, live_view)``; either may be None; fresh dicts."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None, None
+
+    is_summary = is_compaction_summary_message(message)
+    handoff: Optional[Dict[str, Any]] = None
+    if is_summary:
+        handoff = {
+            "role": "user", "content": _handoff_only_content(message.get("content")),
+            COMPRESSED_SUMMARY_METADATA_KEY: True, "display_kind": "hidden",
+        }
+        if COMPRESSED_SUMMARY_HAS_USER_TURN_KEY in message:
+            handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = bool(message.get(COMPRESSED_SUMMARY_HAS_USER_TURN_KEY))
+        if message.get(MICRO_COMPACT_MARKER_KEY):
+            handoff[MICRO_COMPACT_MARKER_KEY] = True
+        if message.get("timestamp") is not None:
+            handoff["timestamp"] = message["timestamp"]
+        drop_stale_api_content(handoff)
+        # Hidden is the legacy compaction wrapper and doesn't hide an unwrapped human payload; other
+        # kinds are synthetic.
+        display_kind = message.get("display_kind")
+        candidate = None if display_kind and display_kind != "hidden" else ContextCompressor._strip_context_summary_handoff_message(message)
+        if candidate is None:
+            return handoff, None
+    elif message.get("display_kind"):
+        return None, None
+    else:
+        candidate = message.copy()
+
+    for key in (
+        COMPRESSED_SUMMARY_METADATA_KEY, COMPRESSED_SUMMARY_HAS_USER_TURN_KEY, MICRO_COMPACT_MARKER_KEY,
+        _DB_PERSISTED_MARKER, *(("_row_id",) if is_summary else ()), "display_kind", "display_metadata",
+    ):
+        candidate.pop(key, None)
+    carrier_metadata = message.get("display_metadata")
+    if isinstance(carrier_metadata, dict):
+        durable_metadata = {
+            key: copy.deepcopy(carrier_metadata[key]) for key in SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS if key in carrier_metadata
+        }
+        if durable_metadata:
+            candidate["display_metadata"] = durable_metadata
+    drop_stale_api_content(candidate)
+    cls = ContextCompressor
+    if cls._is_synthetic_compression_user_turn(candidate) or not cls._is_actionable_user_turn(candidate):
+        return handoff, None
+    return handoff, candidate
+
+
+def user_originated_turn_view(message: Any) -> Optional[Dict[str, Any]]:
+    """Return the live human-authored projection of a user row, if any."""
+    return split_user_originated_turn(message)[1]
+
+
+def history_before_user_originated_turn(
+    messages: List[Dict[str, Any]], index: int,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Rewind prefix and canonical live view for ``index``; a composite carrier keeps its handoff scaffold at the head."""
+    if index < 0 or index >= len(messages):
+        raise IndexError("user turn index is outside the transcript")
+    handoff, live_view = split_user_originated_turn(messages[index])
+    if live_view is None:
+        raise ValueError("selected row is not a user-originated turn")
+    prefix = [message.copy() for message in messages[:index]] + ([handoff] if handoff is not None else [])
+    return prefix, live_view
+
+
+def retryable_user_text(content: Any) -> str:
+    """Lossless retry text, or raise before destructive mutation (media/unknown parts fail closed: no replay protocol)."""
+    if not isinstance(content, (str, list)):
+        raise ValueError("retry does not support non-text content")
+    chunks: list[str] = []
+    for part in [content] if isinstance(content, str) else content:
+        if isinstance(part, str):
+            chunks.append(part)
+            continue
+        if not isinstance(part, dict):
+            raise ValueError("retry does not support non-text content")
+        if part.get("type") not in {"text", "input_text", "output_text"}:
+            raise ValueError("retry does not support media or unknown content parts")
+        if set(part) - {"type", "text"}:
+            raise ValueError("retry cannot losslessly flatten annotated text parts")
+        if not isinstance(part.get("text"), str):
+            raise ValueError("retry text parts must contain text")
+        chunks.append(part["text"])
+    text = "".join(chunks)
+    if not text.strip():
+        raise ValueError("retry found no text to send")
+    return text

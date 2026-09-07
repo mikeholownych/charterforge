@@ -63,7 +63,7 @@ def _terminal_action_resource(scope: dict) -> str:
 # The terminal tool polls this during command execution so it can kill
 # long-running subprocesses immediately instead of blocking until timeout.
 # ---------------------------------------------------------------------------
-from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — re-exported
+from tools.interrupt import is_interrupted  # noqa: F401 — re-exported
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 
 

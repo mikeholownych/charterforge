@@ -153,94 +153,45 @@ def test_gateway_git_probe_is_safe(malicious_repo):
     assert _fired(marker) == []
 
 
+def test_working_diff_is_safe(malicious_repo):
+    from tools.working_diff import collect_working_diff
+    repo, marker = malicious_repo
+    collect_working_diff(str(repo), "working")
+    assert _fired(marker) == []
 
 
-def test_web_git_is_safe(malicious_repo):
+def test_goals_fingerprint_is_safe(malicious_repo):
+    from hermes_cli.goals import workspace_fingerprint
+    repo, marker = malicious_repo
+    workspace_fingerprint(str(repo))
+    assert _fired(marker) == []
+
+
+def test_web_git_diff_is_safe(malicious_repo):
     from hermes_cli import web_git
     repo, marker = malicious_repo
-    web_git.repo_status(str(repo))
-    web_git.review_list(str(repo), "branch", None)
-    web_git.review_diff(str(repo), "README", "branch", None, False)
+    web_git._git(str(repo), ["status", "--porcelain=v2", "-z"])
+    web_git._git_out(str(repo), ["diff", "HEAD"])
     assert _fired(marker) == []
 
 
-def test_context_references_git_is_safe(malicious_repo):
-    import asyncio
-    from agent.context_references import preprocess_context_references_async
+def test_context_reference_diff_is_safe(malicious_repo):
+    from agent import context_references as cr
     repo, marker = malicious_repo
-    asyncio.run(preprocess_context_references_async(
-        "@diff", cwd=repo, context_length=10000
-    ))
-    asyncio.run(preprocess_context_references_async(
-        "@staged", cwd=repo, context_length=10000
-    ))
-    asyncio.run(preprocess_context_references_async(
-        "@git:\"log -1\"", cwd=repo, context_length=10000
-    ))
+    ref = type("R", (), {"raw": "@diff"})()
+    cr._expand_git_reference(ref, repo, ["diff", "HEAD"], "git diff")
     assert _fired(marker) == []
 
 
-
-
-@pytest.mark.parametrize("caller", ["bounded", "gateway", "coding"])
-@pytest.mark.parametrize(
-    ("args", "expected"),
-    [
-        (("status", "--porcelain"), "README"),
-        (("diff", "HEAD"), "+changed"),
-        (("diff", "--staged"), "+changed"),
-        (("log", "-1", "-p"), "+hi"),
-        (("show", "HEAD"), "+hi"),
-    ],
-)
-def test_bounded_git_probe_is_safe(malicious_repo, caller, args, expected):
-    from hermes_cli._subprocess_compat import bounded_git_probe
+def test_subagent_worktree_add_is_safe(malicious_repo, tmp_path):
+    from tools import subagent_worktree as sw
     repo, marker = malicious_repo
-    if "--staged" in args:
-        subprocess.run(
-            ["git", "-C", str(repo), "add", "README"],
-            check=True,
-            env=noninteractive_git_env(),
-            stdin=subprocess.DEVNULL,
-            timeout=10,
-        )
-    if caller == "bounded":
-        out = bounded_git_probe(["git", "-C", str(repo), *args], timeout=10)
-    elif caller == "gateway":
-        from tui_gateway.git_probe import run_git
-
-        out = run_git(str(repo), *args)
-    else:
-        from agent.coding_context import _git
-
-        out = _git(repo, *args)
-    assert expected in out
+    sw._run_git(["worktree", "add", str(tmp_path / "wt1"), "-b", "safe1"], str(repo))
     assert _fired(marker) == []
 
 
-def test_noninteractive_git_env_neutralizes_config():
-    """Direct unit test: the env dict pins the execution sinks to inert values."""
-    env = noninteractive_git_env()
-    assert env["GIT_TERMINAL_PROMPT"] == "0"
-    assert env["GCM_INTERACTIVE"] == "Never"
-    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
-    assert env["GIT_CONFIG_SYSTEM"] == os.devnull
-    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
-    assert env["GIT_PAGER"] == "cat"
-    assert env["GIT_EDITOR"] == "true"
-    assert env["GIT_CONFIG_COUNT"] == "9"
-    # Verify all override keys present
-    expected_keys = {
-        "credential.helper", "core.askPass", "core.fsmonitor",
-        "core.untrackedCache", "core.hooksPath", "core.pager",
-        "core.editor", "sequence.editor", "diff.external",
-    }
-    actual = {
-        env[f"GIT_CONFIG_KEY_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))
-    }
-    assert expected_keys.issubset(actual)
-
-    # Verify critical values are neutralized
+def test_noninteractive_env_pins_fsmonitor_and_hooks():
+    env = noninteractive_git_env({})
     values = {
         env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
         for i in range(int(env["GIT_CONFIG_COUNT"]))

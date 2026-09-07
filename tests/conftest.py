@@ -634,13 +634,74 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         config.option.timeout_method = "thread"
 
 
-def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
-    """Skip ``requires_wal`` tests when the linked SQLite can't use WAL.
+# ── Host-OS test gating (extracted from upstream) ───────────────────────────
+# A test whose subject is genuinely OS-specific declares the OS it belongs to
+# and runs there for real:
+#
+#   @pytest.mark.windows_only   → only on native Windows (``sys.platform == "win32"``)
+#   @pytest.mark.macos_only     → only on macOS (``sys.platform == "darwin"``)
+#   @pytest.mark.linux_only     → only on Linux (``sys.platform.startswith("linux")``)
+#
+# Elsewhere the test is skipped, not faked: faking the host made tests pass on
+# Linux while telling us nothing about Windows (msvcrt still not importable,
+# taskkill not on PATH, paths still POSIX).
+_OS_MARKS = {
+    "linux_only": (
+        lambda: sys.platform.startswith("linux"),
+        "Linux",
+    ),
+    "macos_only": (
+        lambda: sys.platform == "darwin",
+        "macOS",
+    ),
+    "windows_only": (
+        lambda: sys.platform == "win32",
+        "native Windows",
+    ),
+}
 
-    Cheaper and more honest than each test hand-rolling a version check: the
-    reason string names the actual linked version so the skip is diagnosable
-    rather than mysterious.
+
+def _reject_multiple_os_marks(items):
+    """Fail collection when one test carries two host-OS markers.
+
+    Every marker in ``_OS_MARKS`` skips on all but one host, so two of them
+    on the same item means it is skipped on *every* host — a test that never
+    runs anywhere, reported as green by both lanes.
     """
+    offenders = []
+    for item in items:
+        marks = sorted({m.name for m in item.iter_markers() if m.name in _OS_MARKS})
+        if len(marks) > 1:
+            offenders.append(f"  {item.nodeid}: {', '.join(marks)}")
+    if offenders:
+        raise pytest.UsageError(
+            "a test may carry at most one host-OS marker "
+            f"({', '.join(_OS_MARKS)}); these carry several and would be "
+            "skipped on every host:\n" + "\n".join(offenders)
+        )
+
+
+def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
+    """Apply host-OS gating, then skip ``requires_wal`` where WAL is unusable.
+
+    OS gating: a test marked ``linux_only`` / ``macos_only`` /
+    ``windows_only`` runs only on that host; elsewhere it is skipped, not
+    faked. WAL gating is cheaper and more honest than each test hand-rolling
+    a version check: the reason string names the actual linked version so the
+    skip is diagnosable rather than mysterious.
+    """
+    _reject_multiple_os_marks(items)
+
+    for mark_name, (is_host, label) in _OS_MARKS.items():
+        if is_host():
+            continue
+        skip_os = pytest.mark.skip(
+            reason=f"{label}-only test (marked {mark_name}); host is {sys.platform}"
+        )
+        for item in items:
+            if item.get_closest_marker(mark_name) is not None:
+                item.add_marker(skip_os)
+
     if _wal_is_usable():
         return
 
