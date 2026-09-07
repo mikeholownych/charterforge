@@ -148,3 +148,16 @@ commits, all ported) + browser_camofox upstream snapshot.
 Exit evidence: governed-authorization + private-page guard + console-window
 32/32 (long-standing console failures resolved); browser_camofox 87/87;
 regression sweep 124/124.
+
+## Gate 5 Status: COMPLETE (2026-09-06, commit fce5f55a13)
+
+Completed the multiplex dotenv isolation backport by adopting upstream's
+authoritative env_loader/_early_recovery/secret_sources/secret_scope. All
+four defects closed: pre-assignment NameError, constant-True recovery skip
+(now tracks _UPDATE_RETRY_RECOVERED), load_external_secrets=False honored on
+both branches, and scoped hydration that never mutates os.environ
+(hydrate_profile_secret_sources → per-home snapshot → build_profile_secret_scope).
+
+Exit evidence: new 7-test multiplex-scope suite red→green; env-loader family +
+secret sources 155/155; state 259/259; security/kanban/goals/watcher/objective/
+startup sweep 171/171.
