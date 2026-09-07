@@ -120,3 +120,19 @@ Follow-on gates identified during this gate:
 | Browser-layer decomposition | tools.browser_tool monolith (fork governed-browser IP, 3 commits) lacks 17 names the adopted browser_tool_* siblings import (AGENT_BROWSER_NPX_SPEC, orphan-reap registry, vision fallback). 2 console-window test failures remain. |
 | Branding consistency | Upstream-adopted files carry "Hermes" user-facing strings (auth family 49+); fork rebrand strings lost in wholesale adoption. Cosmetic; needs a deliberate pass distinguishing protocol/model "Hermes" mentions from product branding. |
 | Gateway startup verification | gateway/startup_watchdog.py arrived via adoption; verify gateway import chain + objective watcher wiring (gate 3). |
+
+## Gate 3 Status: COMPLETE (2026-09-06, commit 4b339af169)
+
+Restored governed objective-watcher gateway wiring (import + base + supervised
+spawn; mixin verified in MRO) lost to an earlier --theirs resolution, with a
+new behavioral wiring regression suite. Completed the full-tree upstream sweep
+(every upstream .py now present: agent/monitoring, tui_gateway methods/hosted
+rooms, acp_adapter, plugins family, tools/registry). Reconciled fork
+DEFAULT_CONFIG sections with config_defaults (gateway watchdog / agent
+stall/turn-liveness / cron preflight / security approval keys) + read_user_config_raw.
+
+Exit evidence: objective service/worker/runner-startup/wiring 49/49;
+state suite 259/259; security+contract+kanban+coding+goals+wiring sweep 182/182.
+
+Remaining follow-on: browser-layer decomposition (gate 4), dotenv/multiplex
+lifecycle (gate 5), branding pass, then autonomy enhancements.
