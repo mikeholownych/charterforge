@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS objectives (
     max_spend_minor       INTEGER,
     currency              TEXT,
     expires_at            INTEGER,
+    blocked_replan_attempts INTEGER NOT NULL DEFAULT 0,
     reaffirmed_at         INTEGER NOT NULL,
     created_at            INTEGER NOT NULL,
     updated_at            INTEGER NOT NULL,
@@ -546,6 +547,12 @@ def connect(path: Optional[Path] = None) -> sqlite3.Connection:
             "organization_id TEXT NOT NULL DEFAULT '__unscoped__'"
         )
         conn.commit()
+    if "blocked_replan_attempts" not in columns:
+        conn.execute(
+            "ALTER TABLE objectives ADD COLUMN "
+            "blocked_replan_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
     action_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(candidate_actions)")
     }
@@ -810,6 +817,34 @@ def reaffirm_objective(
     return get_objective(conn, objective_id)
 
 
+def blocked_replan_attempts(conn: sqlite3.Connection, objective_id: str) -> int:
+    row = conn.execute(
+        "SELECT blocked_replan_attempts FROM objectives WHERE id=?",
+        (objective_id,),
+    ).fetchone()
+    return int(row["blocked_replan_attempts"] or 0) if row is not None else 0
+
+
+def record_blocked_replan(conn: sqlite3.Connection, objective_id: str) -> int:
+    """Increment and return the durable blocked-replan attempt counter."""
+    with conn:
+        conn.execute(
+            "UPDATE objectives SET blocked_replan_attempts = "
+            "blocked_replan_attempts + 1, updated_at = ? WHERE id=?",
+            (_now(), objective_id),
+        )
+    return blocked_replan_attempts(conn, objective_id)
+
+
+def reset_blocked_replan(conn: sqlite3.Connection, objective_id: str) -> None:
+    with conn:
+        conn.execute(
+            "UPDATE objectives SET blocked_replan_attempts = 0, updated_at = ? "
+            "WHERE id=?",
+            (_now(), objective_id),
+        )
+
+
 def transition_objective(
     conn: sqlite3.Connection,
     objective_id: str,
@@ -861,6 +896,8 @@ def transition_objective(
             previous_status=current,
             next_status=next_status,
         )
+        if next_status in TERMINAL_OBJECTIVE_STATUSES:
+            reset_blocked_replan(conn, objective_id)
     _mirror_objective_status_to_postgres(
         objective_id=objective_id,
         organization_id=row["organization_id"],

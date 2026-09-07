@@ -110,3 +110,71 @@ class TestCharterValidation:
         objective_policy.validate_charter(
             _charter(blocked_outcome_policy={"mode": "  autonomous  "})
         )
+
+
+# Adaptation vs. the planned fixture: objectives_db.connect() resolves its
+# path arg (":memory:" would become a literal <cwd>/:memory: file), so the
+# store is opened against a per-test tmp_path instead.
+@pytest.fixture()
+def conn(tmp_path):
+    from hermes_cli import objectives_db
+
+    conn = objectives_db.connect(tmp_path / "objectives.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _make_objective(conn):
+    from hermes_cli import objectives_db as db
+
+    return db.create_objective(
+        conn,
+        organization_id="__unscoped__",
+        desired_outcome="prove the outcome",
+        originator="human_operator:setup",
+        owner="employee:ceo-1",
+        constraints=[],
+        authority_scope={"capabilities": []},
+        success_criteria=[{"verifier": "v", "params": {}}],
+        termination_conditions=[],
+        permitted_systems=[],
+        prohibited_actions=[],
+        max_spend_minor=1000,
+        currency="USD",
+        expires_at=None,
+    )
+
+
+class TestReplanCounter:
+    def test_column_exists_and_defaults_zero(self, conn):
+        from hermes_cli import objectives_db as db
+
+        obj = _make_objective(conn)
+        assert db.blocked_replan_attempts(conn, obj.id) == 0
+
+    def test_increment_and_reset(self, conn):
+        from hermes_cli import objectives_db as db
+
+        obj = _make_objective(conn)
+        assert db.record_blocked_replan(conn, obj.id) == 1
+        assert db.record_blocked_replan(conn, obj.id) == 2
+        db.reset_blocked_replan(conn, obj.id)
+        assert db.blocked_replan_attempts(conn, obj.id) == 0
+
+    def test_counter_is_scoped_per_objective(self, conn):
+        from hermes_cli import objectives_db as db
+
+        a = _make_objective(conn)
+        b = _make_objective(conn)
+        db.record_blocked_replan(conn, a.id)
+        assert db.blocked_replan_attempts(conn, b.id) == 0
+
+    # Adaptation vs. the planned test: "abandoned" is not reachable from the
+    # "proposed" state (_TRANSITIONS); "cancelled" is reachable and terminal.
+    def test_reset_on_terminal_transition(self, conn):
+        from hermes_cli import objectives_db as db
+
+        obj = _make_objective(conn)
+        db.record_blocked_replan(conn, obj.id)
+        db.transition_objective(conn, obj.id, "cancelled", actor="test")
+        assert db.blocked_replan_attempts(conn, obj.id) == 0
