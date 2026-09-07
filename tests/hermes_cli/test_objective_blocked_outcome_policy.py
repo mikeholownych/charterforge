@@ -158,7 +158,8 @@ class TestReplanCounter:
         obj = _make_objective(conn)
         assert db.record_blocked_replan(conn, obj.id) == 1
         assert db.record_blocked_replan(conn, obj.id) == 2
-        db.reset_blocked_replan(conn, obj.id)
+        with conn:
+            db.reset_blocked_replan(conn, obj.id)
         assert db.blocked_replan_attempts(conn, obj.id) == 0
 
     def test_counter_is_scoped_per_objective(self, conn):
@@ -178,3 +179,77 @@ class TestReplanCounter:
         db.record_blocked_replan(conn, obj.id)
         db.transition_objective(conn, obj.id, "cancelled", actor="test")
         assert db.blocked_replan_attempts(conn, obj.id) == 0
+
+    def test_record_raises_for_unknown_objective(self, conn):
+        from hermes_cli import objectives_db as db
+
+        with pytest.raises(KeyError, match="objective not found"):
+            db.record_blocked_replan(conn, "obj-does-not-exist")
+
+    def test_counter_survives_reopen(self, tmp_path):
+        """Durability: the counter and the terminal-reset survive closing and
+        reopening the store."""
+        from hermes_cli import objectives_db as db
+
+        path = tmp_path / "objectives.db"
+        with db.connect_closing(str(path)) as c1:
+            obj = _make_objective(c1)
+            assert db.record_blocked_replan(c1, obj.id) == 1
+            obj_id = obj.id
+        with db.connect_closing(str(path)) as c2:
+            assert db.blocked_replan_attempts(c2, obj_id) == 1
+
+    # Adaptation vs. the planned test: the legacy DDL mirrors SCHEMA_SQL's
+    # objectives table exactly minus the counter column, including
+    # `version INTEGER NOT NULL DEFAULT 1` (absent from the planned snippet).
+    def test_legacy_store_migrates_in_place(self, tmp_path):
+        """A pre-column store (objectives table built without the column)
+        gains blocked_replan_attempts via connect()'s ALTER path, and existing
+        rows read 0."""
+        from hermes_cli import objectives_db as db
+
+        path = tmp_path / "legacy.db"
+        raw = sqlite3.connect(str(path))
+        raw.executescript(
+            """
+            CREATE TABLE objectives (
+                id                      TEXT PRIMARY KEY,
+                organization_id         TEXT NOT NULL DEFAULT '__unscoped__',
+                desired_outcome         TEXT NOT NULL,
+                status                  TEXT NOT NULL,
+                originator              TEXT NOT NULL,
+                owner                   TEXT,
+                constraints_json        TEXT NOT NULL,
+                authority_scope_json    TEXT NOT NULL,
+                success_criteria_json   TEXT NOT NULL,
+                termination_json        TEXT NOT NULL,
+                permitted_systems_json  TEXT NOT NULL,
+                prohibited_actions_json TEXT NOT NULL,
+                max_spend_minor         INTEGER,
+                currency                TEXT,
+                expires_at              INTEGER,
+                reaffirmed_at           INTEGER NOT NULL,
+                created_at              INTEGER NOT NULL,
+                updated_at              INTEGER NOT NULL,
+                version                 INTEGER NOT NULL DEFAULT 1
+            );
+            INSERT INTO objectives (
+                id, desired_outcome, status, originator, constraints_json,
+                authority_scope_json, success_criteria_json,
+                termination_json, permitted_systems_json,
+                prohibited_actions_json, reaffirmed_at, created_at, updated_at
+            ) VALUES (
+                'obj-legacy', 'outcome', 'accepted', 'setup', '[]', '{}',
+                '[]', '[]', '[]', '[]', 0, 0, 0
+            );
+            """
+        )
+        raw.commit()
+        raw.close()
+        with db.connect_closing(str(path)) as c:
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(objectives)")}
+            assert "blocked_replan_attempts" in cols
+            row = c.execute(
+                "SELECT blocked_replan_attempts FROM objectives WHERE id='obj-legacy'"
+            ).fetchone()
+            assert row["blocked_replan_attempts"] == 0

@@ -818,6 +818,10 @@ def reaffirm_objective(
 
 
 def blocked_replan_attempts(conn: sqlite3.Connection, objective_id: str) -> int:
+    """Current durable blocked-replan attempt count for one objective.
+
+    Returns 0 when the row is absent (fresh-schema reads).
+    """
     row = conn.execute(
         "SELECT blocked_replan_attempts FROM objectives WHERE id=?",
         (objective_id,),
@@ -826,23 +830,34 @@ def blocked_replan_attempts(conn: sqlite3.Connection, objective_id: str) -> int:
 
 
 def record_blocked_replan(conn: sqlite3.Connection, objective_id: str) -> int:
-    """Increment and return the durable blocked-replan attempt counter."""
+    """Increment and return the durable blocked-replan attempt counter.
+
+    Read-back happens inside the same transaction so a concurrent worker's
+    increment is never folded into this call's return value. Raises KeyError
+    for an unknown objective id (consistent with get_objective)."""
     with conn:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE objectives SET blocked_replan_attempts = "
             "blocked_replan_attempts + 1, updated_at = ? WHERE id=?",
             (_now(), objective_id),
         )
-    return blocked_replan_attempts(conn, objective_id)
+        if cur.rowcount != 1:
+            raise KeyError(f"objective not found: {objective_id}")
+        row = conn.execute(
+            "SELECT blocked_replan_attempts FROM objectives WHERE id=?",
+            (objective_id,),
+        ).fetchone()
+    return int(row["blocked_replan_attempts"] or 0)
 
 
 def reset_blocked_replan(conn: sqlite3.Connection, objective_id: str) -> None:
-    with conn:
-        conn.execute(
-            "UPDATE objectives SET blocked_replan_attempts = 0, updated_at = ? "
-            "WHERE id=?",
-            (_now(), objective_id),
-        )
+    """Zero the blocked-replan attempt counter. Caller owns the transaction
+    (same convention as _append_event)."""
+    conn.execute(
+        "UPDATE objectives SET blocked_replan_attempts = 0, updated_at = ? "
+        "WHERE id=?",
+        (_now(), objective_id),
+    )
 
 
 def transition_objective(
