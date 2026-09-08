@@ -264,6 +264,10 @@ _SPECS = [
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
     ], help="Append a comment"),
+    _cmd("learn", [
+        _arg("assignee", help="Specialist profile the learning belongs to"),
+        _arg("text", nargs="+", help="Learning text (rest of the line)"),
+    ], help="Record a durable specialist learning (injected into that profile's future worker prompts)"),
     _cmd("attach", [
         _TASK_ID,
         _arg("path", help="Path to the local file to attach"),

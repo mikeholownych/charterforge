@@ -551,6 +551,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
 
+    # --- learn: durable per-specialist learnings ---
+    p_learn = sub.add_parser(
+        "learn",
+        help="Record a durable specialist learning (injected into that "
+             "profile's future worker prompts)",
+    )
+    p_learn.add_argument("assignee",
+                         help="Specialist profile the learning belongs to")
+    p_learn.add_argument("text", nargs="+",
+                         help="Learning text (rest of the line)")
+
     # --- attach / attachments / attach-rm ---
     p_attach = sub.add_parser("attach", help="Attach a local file to a task")
     p_attach.add_argument("task_id")
@@ -1036,6 +1047,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
+            "learn":    _cmd_learn,
             "attach":   _cmd_attach,
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
@@ -2023,6 +2035,25 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
+    return 0
+
+
+def _cmd_learn(args: argparse.Namespace) -> int:
+    """Record a durable specialist learning beside the active board."""
+    from hermes_cli import kanban_specialist
+
+    text = " ".join(args.text).strip()
+    if not text:
+        print("kanban: empty learning text", file=sys.stderr)
+        return 2
+    if not kanban_specialist.record_learning(kb.board_dir(), args.assignee, text):
+        print(
+            f"kanban: could not record learning for {args.assignee!r} "
+            "(empty text or invalid profile name)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Learning recorded for {args.assignee}")
     return 0
 
 

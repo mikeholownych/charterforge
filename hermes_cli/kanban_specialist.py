@@ -18,6 +18,8 @@ The roster is matched at dispatch time (creation-time routing lives in
 from __future__ import annotations
 
 import logging
+import time
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -220,3 +222,103 @@ def route_task(task_desc: str, roster: Any = None) -> Optional[str]:
             "kanban specialist routing: routing skipped (%s)", exc,
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# Durable per-specialist learnings
+#
+# Learnings are one file per assignee beside the board
+# (``<kanban_dir>/.learnings/<assignee>.md``), appended by the operator /
+# closing worker and injected into the worker's spawn prompt so a
+# specialist keeps its accumulated project knowledge across tasks.
+# Injection is strictly opt-in-by-content: an empty/missing file changes
+# nothing, and every failure path degrades to the unchanged prompt.
+# ---------------------------------------------------------------------------
+
+_LEARNINGS_DIRNAME = ".learnings"
+_LEARNINGS_MAX_ENTRIES = 50
+
+
+def learnings_dir(kanban_dir: Path) -> Path:
+    """Directory holding per-assignee learning files beside *kanban_dir*."""
+    return Path(kanban_dir) / _LEARNINGS_DIRNAME
+
+
+def _sanitize_learning_assignee(assignee: Any) -> str:
+    """Validate a learnings filename stem; "" means "refused".
+
+    Refuses empty names, path separators, and dot-segments so the name can
+    never escape the learnings directory (``../evil``, ``..``, ``.``).
+    """
+    name = str(assignee or "").strip()
+    if not name:
+        return ""
+    if "/" in name or "\\" in name or ".." in name or not name.strip("."):
+        return ""
+    return name
+
+
+def record_learning(kanban_dir: Path, assignee: str, text: str) -> bool:
+    """Append one timestamped learning to ``<kanban_dir>/.learnings/<assignee>.md``.
+
+    One call = one line (embedded newlines are collapsed). Returns True on
+    success; False is a no-op (empty/whitespace text, invalid assignee, or
+    I/O error) — recording never raises into the caller.
+    """
+    name = _sanitize_learning_assignee(assignee)
+    body = " ".join(str(text or "").split())
+    if not name or not body:
+        return False
+    try:
+        target = learnings_dir(kanban_dir) / f"{name}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(f"- [{timestamp}] {body}\n")
+    except OSError as exc:
+        logger.warning(
+            "kanban learnings: could not record for %r (%s)", name, exc,
+        )
+        return False
+    return True
+
+
+def load_learnings(kanban_dir: Path, assignee: str) -> str:
+    """Return the assignee's learnings ("" when missing/invalid).
+
+    Capped at the last ``_LEARNINGS_MAX_ENTRIES`` entries so the injected
+    prompt section stays bounded no matter how long a specialist has been
+    running.
+    """
+    name = _sanitize_learning_assignee(assignee)
+    if not name:
+        return ""
+    try:
+        raw = (learnings_dir(kanban_dir) / f"{name}.md").read_text(
+            encoding="utf-8",
+        )
+    except (OSError, UnicodeDecodeError):
+        return ""
+    lines = [line for line in raw.splitlines() if line.strip()]
+    return "\n".join(lines[-_LEARNINGS_MAX_ENTRIES:])
+
+
+def build_worker_prompt(task_body: str, assignee: str, kanban_dir: Path) -> str:
+    """Worker spawn prompt: *task_body* first, learnings section appended.
+
+    Empty/missing learnings → *task_body* unchanged (no header, no
+    injection — the spawn path is byte-identical to pre-learnings
+    behaviour). Never raises: learnings problems degrade to the unchanged
+    task body so spawn can never be blocked by them.
+    """
+    body = task_body or ""
+    try:
+        learnings = load_learnings(kanban_dir, assignee)
+    except Exception as exc:  # pragma: no cover - load_learnings cannot raise
+        logger.debug("kanban learnings: load failed (%s)", exc)
+        return body
+    if not learnings:
+        return body
+    return (
+        f"{body}\n\n## Your specialist learnings (from prior tasks)\n\n{learnings}"
+    )

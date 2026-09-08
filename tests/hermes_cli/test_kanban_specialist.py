@@ -179,3 +179,85 @@ class TestSpecialistRouting:
 
         _enabled(monkeypatch)
         assert ks.route_task("Anything", {"profiles": []}) is None
+
+
+class TestLearnings:
+    def test_write_and_read_learnings(self, board_env):
+        from hermes_cli import kanban_specialist as ks
+
+        home, _conn = board_env
+        kanban_dir = home / "kanban"
+        ks.record_learning(str(kanban_dir), "backend-dev",
+                           "The API uses cursor pagination, not offsets.")
+        text = ks.load_learnings(str(kanban_dir), "backend-dev")
+        assert "cursor pagination" in text
+
+    def test_learnings_scoped_per_assignee(self, board_env):
+        from hermes_cli import kanban_specialist as ks
+
+        home, _conn = board_env
+        kanban_dir = home / "kanban"
+        ks.record_learning(str(kanban_dir), "backend-dev", "api note")
+        ks.record_learning(str(kanban_dir), "frontend-dev", "ui note")
+        assert "api note" in ks.load_learnings(str(kanban_dir), "backend-dev")
+        assert "api note" not in ks.load_learnings(str(kanban_dir), "frontend-dev")
+
+    def test_learnings_append_with_timestamp(self, board_env):
+        from hermes_cli import kanban_specialist as ks
+
+        home, _conn = board_env
+        kanban_dir = home / "kanban"
+        ks.record_learning(str(kanban_dir), "backend-dev", "note one")
+        ks.record_learning(str(kanban_dir), "backend-dev", "note two")
+        text = ks.load_learnings(str(kanban_dir), "backend-dev")
+        assert "note one" in text and "note two" in text
+        assert "[2" in text  # timestamped entries
+
+    def test_empty_text_is_noop(self, board_env):
+        from hermes_cli import kanban_specialist as ks
+
+        home, _conn = board_env
+        kanban_dir = home / "kanban"
+        assert ks.record_learning(str(kanban_dir), "backend-dev", "   ") is False
+        assert ks.load_learnings(str(kanban_dir), "backend-dev") == ""
+
+    def test_invalid_assignee_refused(self, board_env):
+        from hermes_cli import kanban_specialist as ks
+
+        home, _conn = board_env
+        kanban_dir = home / "kanban"
+        assert ks.record_learning(str(kanban_dir), "../evil", "x") is False
+        assert ks.record_learning(str(kanban_dir), "", "x") is False
+        assert ks.load_learnings(str(kanban_dir), "../evil") == ""
+
+    def test_learnings_capped_at_tail(self, board_env):
+        from hermes_cli import kanban_specialist as ks
+
+        home, _conn = board_env
+        kanban_dir = home / "kanban"
+        for i in range(60):
+            ks.record_learning(str(kanban_dir), "backend-dev", f"note {i}")
+        text = ks.load_learnings(str(kanban_dir), "backend-dev")
+        assert "note 0" not in text  # head evicted
+        assert "note 59" in text     # tail retained
+
+    def test_build_worker_prompt_includes_learnings(self, board_env):
+        from hermes_cli import kanban_specialist as ks
+
+        home, _conn = board_env
+        kanban_dir = home / "kanban"
+        ks.record_learning(str(kanban_dir), "backend-dev",
+                           "Cursor pagination only.")
+        prompt = ks.build_worker_prompt(
+            "Add pagination.", "backend-dev", kanban_dir,
+        )
+        assert "Add pagination." in prompt
+        assert "Cursor pagination only." in prompt
+        assert prompt.find("Add pagination.") < prompt.find("Cursor pagination only.")
+
+    def test_build_worker_prompt_empty_learnings_unchanged(self, board_env):
+        from hermes_cli import kanban_specialist as ks
+
+        home, _conn = board_env
+        prompt = ks.build_worker_prompt("Just the task.", "nobody", home / "kanban")
+        assert prompt == "Just the task."

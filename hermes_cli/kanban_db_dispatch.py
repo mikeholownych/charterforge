@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import signal
@@ -26,6 +27,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+
+
+logger = logging.getLogger(__name__)
 
 
 # After this many consecutive non-success attempts on a task/profile the
@@ -2083,7 +2087,40 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+def _worker_prompt(task: Task, board: Optional[str]) -> str:
+    """Quiet-mode worker prompt, optionally extended with specialist learnings.
+
+    Learnings live beside the board (``<board_dir>/.learnings/<assignee>.md``)
+    and are injected only when non-empty. Strictly fail-open: any error
+    leaves the base prompt unchanged — a learnings I/O problem must never
+    block a spawn.
+    """
+    base = f"work kanban task {task.id}"
+    try:
+        from hermes_cli import kanban_specialist
+
+        prompt = kanban_specialist.build_worker_prompt(
+            base, task.assignee or "", _kb.board_dir(board=board),
+        )
+    except Exception as exc:
+        logger.debug(
+            "kanban dispatch: learnings injection skipped for task %s (%s)",
+            task.id, exc,
+        )
+        return base
+    if prompt != base:
+        logger.debug(
+            "kanban dispatch: injected specialist learnings into the "
+            "worker prompt (task %s)",
+            task.id,
+        )
+    return prompt
+
+
+def _worker_argv(
+    task: Task, profile_arg: str, hermes_home: Optional[str],
+    board: Optional[str] = None,
+) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = [
         *_resolve_hermes_argv(),
@@ -2114,7 +2151,7 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.extend(["chat", "-q", _worker_prompt(task, board)])
     if task.goal_mode:
         # The kanban goal-loop hook only runs in cli.py's fully-quiet branch.
         # Without -Q the worker gets one turn, prints text, exits rc=0, and the
@@ -2250,7 +2287,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"), board=board)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
