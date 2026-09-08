@@ -2,6 +2,7 @@
 evaluation, controlled promotion. Default OFF; agent-authored skills only."""
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import tempfile
@@ -256,3 +257,140 @@ def run_evaluation(skill_dir: str | Path) -> Dict[str, Any]:
         "prompts": prompt_results,
         "manifest_version": manifest.get("version", 1),
     }
+
+
+def evaluate_and_promote(skill_dir: str | Path) -> Dict[str, Any]:
+    """Run the full evolution cycle for one skill: gates → evaluate the
+    staged candidate → snapshot for rollback → atomically promote.
+
+    Governance gates, in order:
+      G1 ``skills.autonomous_evolution`` must be enabled (default off).
+      G2 the skill must be a top-level user skill under ``get_skills_dir()``
+         (never bundled/hub/backup/hidden namespaces) and ``skill_dir`` must
+         resolve to exactly that directory.
+      G3 the ``.usage.json`` provenance marker must be ``created_by: "agent"``.
+
+    On a "pass" verdict, a curator backup snapshot is taken BEFORE any
+    mutation — if the snapshot fails, promotion is aborted (never promote
+    without a rollback path). The swap itself is atomic: the candidate is
+    copied to a staging file inside the skill directory and ``os.replace``d
+    over the live SKILL.md, so a mid-swap failure leaves the incumbent
+    untouched. The staged candidate is consumed (rmtree) only after a
+    successful replace. On "fail"/"error" verdicts the incumbent and the
+    candidate are both preserved.
+    """
+    skill_dir = Path(skill_dir)
+
+    # Deferred imports: tools.* may import heavy deps (and agent -> tools at
+    # module scope would invert the layering); the call-time import also keeps
+    # the gates patchable from tests.
+    from tools.skill_manager_tool import (
+        _evolution_enabled,
+        _evolution_skill_dir,
+        _skill_created_by,
+    )
+
+    # G1: feature gate (fail closed).
+    if not _evolution_enabled():
+        return {
+            "promoted": False,
+            "verdict": "error",
+            "prompts": [],
+            "error": (
+                "autonomous skill evolution is disabled "
+                "(set skills.autonomous_evolution: true in config.yaml)"
+            ),
+        }
+
+    # G2: top-level user skill + path identity.
+    gate_dir = _evolution_skill_dir(skill_dir.name)
+    if gate_dir is None or gate_dir.resolve() != skill_dir.resolve():
+        return {
+            "promoted": False,
+            "verdict": "error",
+            "prompts": [],
+            "error": (
+                f"{skill_dir}: not a top-level user skill directory (G2)"
+            ),
+        }
+
+    # G3: provenance.
+    if _skill_created_by(skill_dir.name) != "agent":
+        return {
+            "promoted": False,
+            "verdict": "error",
+            "prompts": [],
+            "error": (
+                f"{skill_dir.name}: .usage.json created_by is not 'agent' (G3)"
+            ),
+        }
+
+    # Evaluate the CANDIDATE (run_evaluation prefers .candidate/SKILL.md).
+    result = run_evaluation(skill_dir)
+    verdict = result.get("verdict")
+    if verdict != "pass":
+        # Candidate preserved, incumbent untouched.
+        return {"promoted": False, **result}
+
+    candidate = skill_dir / ".candidate" / "SKILL.md"
+    if not candidate.is_file():
+        return {
+            "promoted": False,
+            "verdict": "pass",
+            "prompts": result.get("prompts", []),
+            "manifest_version": result.get("manifest_version"),
+            "error": (
+                f"{skill_dir}: eval passed but no staged candidate "
+                "SKILL.md found to promote"
+            ),
+        }
+
+    # Rollback snapshot BEFORE any mutation — never promote without a backup.
+    from agent.curator_backup import snapshot_skills
+
+    def _snapshot_failure(exc: str) -> Dict[str, Any]:
+        return {
+            "promoted": False,
+            "verdict": "pass",
+            "prompts": result.get("prompts", []),
+            "manifest_version": result.get("manifest_version"),
+            "error": (
+                f"rollback snapshot failed; promotion aborted: {exc}"
+            ),
+        }
+
+    try:
+        snapshot = snapshot_skills(reason="skill_evolution")
+    except Exception as exc:
+        return _snapshot_failure(str(exc))
+    if snapshot is None:
+        return _snapshot_failure("snapshot_skills returned None")
+
+    # Atomic swap: copy candidate to a staging file on the same filesystem,
+    # then os.replace over the live SKILL.md. A failure before the replace
+    # leaves the incumbent untouched.
+    staging = skill_dir / ".SKILL.md.evolving"
+    try:
+        shutil.copy2(candidate, staging)
+        os.replace(staging, skill_dir / "SKILL.md")
+    except OSError as exc:
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {
+            "promoted": False,
+            "verdict": "pass",
+            "prompts": result.get("prompts", []),
+            "manifest_version": result.get("manifest_version"),
+            "error": f"atomic swap failed; live skill untouched: {exc}",
+        }
+
+    # Promotion succeeded — consume the staged candidate (best-effort; the
+    # live skill is already replaced, so a rmtree failure must not un-promote).
+    try:
+        shutil.rmtree(skill_dir / ".candidate")
+    except OSError:
+        pass
+
+    return {"promoted": True, "snapshot": str(snapshot), **result}

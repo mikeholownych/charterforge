@@ -375,3 +375,122 @@ class TestEvaluationRunner:
         result = se.run_evaluation(agent_skill)
         assert result["verdict"] == "error"
         assert "no credentials" in result["error"]
+
+
+class TestPromotion:
+    def test_promote_passing_candidate(self, agent_skill, monkeypatch):
+        from agent import skill_evolution as se
+        import hermes_cli.config as config_mod
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": True}},
+        )
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+        (agent_skill / ".candidate").mkdir(exist_ok=True)
+        (agent_skill / ".candidate" / "SKILL.md").write_text(
+            "# IMPROVED\n\nstep one, verify output. Retry once.\n",
+            encoding="utf-8",
+        )
+
+        snapshots = []
+        monkeypatch.setattr(
+            "agent.curator_backup.snapshot_skills",
+            lambda reason="manual", **k: snapshots.append(reason) or Path("/tmp/fake.tgz"),
+        )
+        class _FakeAgent:
+            def __init__(self, *a, **k): pass
+            def chat(self, message, **k): return "steps, verify, retry once"
+        monkeypatch.setattr(se, "_build_eval_agent", lambda skills_dir: _FakeAgent())
+
+        result = se.evaluate_and_promote(agent_skill)
+        assert result["verdict"] == "pass"
+        assert result["promoted"] is True
+        assert "IMPROVED" in (agent_skill / "SKILL.md").read_text(encoding="utf-8")
+        assert snapshots == ["skill_evolution"]  # backup BEFORE swap
+        assert not (agent_skill / ".candidate").exists()  # consumed
+
+    def test_snapshot_failure_aborts_promotion(self, agent_skill, monkeypatch):
+        """No backup → no promotion (rollback guarantee)."""
+        from agent import skill_evolution as se
+        import hermes_cli.config as config_mod
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": True}},
+        )
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+        (agent_skill / ".candidate").mkdir(exist_ok=True)
+        (agent_skill / ".candidate" / "SKILL.md").write_text(
+            "# IMPROVED\n\nstep one, verify output. Retry once.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "agent.curator_backup.snapshot_skills",
+            lambda reason="manual", **k: (_ for _ in ()).throw(
+                OSError("disk full")),
+        )
+        class _FakeAgent:
+            def __init__(self, *a, **k): pass
+            def chat(self, message, **k): return "steps, verify, retry once"
+        monkeypatch.setattr(se, "_build_eval_agent", lambda skills_dir: _FakeAgent())
+
+        result = se.evaluate_and_promote(agent_skill)
+        assert result["promoted"] is False
+        assert "snapshot" in json.dumps(result).lower()
+        live = (agent_skill / "SKILL.md").read_text(encoding="utf-8")
+        assert "IMPROVED" not in live  # untouched
+        assert (agent_skill / ".candidate" / "SKILL.md").is_file()  # preserved
+
+    def test_failing_candidate_keeps_incumbent(self, agent_skill, monkeypatch):
+        from agent import skill_evolution as se
+        import hermes_cli.config as config_mod
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": True}},
+        )
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+        (agent_skill / ".candidate").mkdir(exist_ok=True)
+        (agent_skill / ".candidate" / "SKILL.md").write_text(
+            "# BROKEN candidate — no manifest keywords\n", encoding="utf-8"
+        )
+        class _BadAgent:
+            def __init__(self, *a, **k): pass
+            def chat(self, message, **k): return "no idea"
+        monkeypatch.setattr(se, "_build_eval_agent", lambda skills_dir: _BadAgent())
+
+        result = se.evaluate_and_promote(agent_skill)
+        assert result["verdict"] == "fail"
+        assert result["promoted"] is False
+        live = (agent_skill / "SKILL.md").read_text(encoding="utf-8")
+        assert "BROKEN" not in live
+        assert (agent_skill / ".candidate" / "SKILL.md").is_file()  # preserved
+
+    def test_promote_refused_when_evolution_disabled(self, agent_skill, monkeypatch):
+        from agent import skill_evolution as se
+        import hermes_cli.config as config_mod
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": False}},
+        )
+        result = se.evaluate_and_promote(agent_skill)
+        assert result["promoted"] is False
+        assert "autonomous_evolution" in json.dumps(result)
+
+    def test_promote_refused_non_agent_skill(self, agent_skill, monkeypatch):
+        from agent import skill_evolution as se
+        import hermes_cli.config as config_mod
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": True}},
+        )
+        (agent_skill.parent / ".usage.json").write_text(json.dumps({
+            "my-skill": {"created_by": "human", "use_count": 0,
+                         "view_count": 0, "patch_count": 0},
+        }), encoding="utf-8")
+        result = se.evaluate_and_promote(agent_skill)
+        assert result["promoted"] is False
+        assert "created_by" in json.dumps(result)
