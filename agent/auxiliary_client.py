@@ -31,6 +31,7 @@ from agent.codex_headers import (
     is_official_codex_base_url as _is_official_codex_base_url,
 )
 
+
 class AuxiliaryProviderNotAuthorized(RuntimeError):
     """Raised fail-closed when a charter's authorized_providers boundary
     leaves no admissible auxiliary provider for a governed call."""

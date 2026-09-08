@@ -31,6 +31,21 @@ class TestAuthorizedAuxiliaryProviders:
         charter = {"enabled": True, "authorized_providers": []}
         assert objective_policy.authorized_auxiliary_providers(charter) is None
 
+    def test_vacuous_list_authorizes_nothing(self):
+        """A non-empty list of whitespace entries returns an empty frozenset
+        (authorize nothing, fail-closed) — NOT None (unrestricted). Raw
+        runtime config is not pre-validated, so this semantics is load-bearing."""
+        charter = {"enabled": True, "authorized_providers": ["  ", ""]}
+        assert objective_policy.authorized_auxiliary_providers(charter) == frozenset()
+
+    def test_validate_charter_accepts_valid_list(self):
+        objective_policy.validate_charter({
+            "enabled": True, "operating_mode": "autonomous",
+            "max_autonomous_risk": "medium", "permit_ttl_seconds": 300,
+            "runtime_host": "gateway",
+            "authorized_providers": ["nous", "openrouter"],
+        })  # must not raise
+
     def test_non_list_rejected_by_validate_charter(self):
         with pytest.raises(ValueError, match="authorized_providers"):
             objective_policy.validate_charter({

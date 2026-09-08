@@ -172,8 +172,14 @@ def authorized_auxiliary_providers(
     charter: Mapping[str, Any],
 ) -> Optional[frozenset[str]]:
     """Providers auxiliary calls may use while this charter governs the
-    runtime, normalized to lowercase; None when the charter does not restrict
-    providers (absent/disabled charter or empty list = unrestricted)."""
+    runtime, normalized to lowercase.
+
+    Returns None — the ONLY unrestricted signal — when the charter is
+    absent, disabled, or declares no/empty authorized_providers. A non-empty
+    list whose entries all strip to empty returns an EMPTY frozenset, which
+    means "authorize nothing": consumers must treat ``boundary is not None``
+    (never truthiness) as the restriction signal and fail closed.
+    """
     if not isinstance(charter, Mapping) or not bool(charter.get("enabled", False)):
         return None
     listed = charter.get("authorized_providers")
