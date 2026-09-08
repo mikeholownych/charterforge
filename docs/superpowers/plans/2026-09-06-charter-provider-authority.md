@@ -414,25 +414,6 @@ Self-review note: the plan's Task 2 must NOT claim coverage of `_try_main_fallba
 
 ## Status: COMPLETE (2026-09-06)
 
-Commits ac9f1b71cc..f37154253d. Final review verdict READY — charter suite
-19/19, policy suites 10+28, objective family 26+27, objectives_db 15/15,
-auxiliary suite failure set byte-identical to base. Governance contract
-traced on the riskiest lines: explicit-branch boundary check fires on the
-wire provider (post-MoA-unwrap) before client build; fail-closed condition
-(unauthorized_attempted and not tried) with the skip taxonomy documented;
-authority_refused propagates end-to-end into durable planner_inferences
-evidence (validation set widened — production masking bug caught in RED).
-
-Follow-ups (non-blocking):
-1. Three unfenced auxiliary ladders (main-chain, payment, discovery) +
-   the vision branch — same _boundary_allows predicate at those acceptance
-   sites; guide already says "do not treat them as authorized surfaces".
-2. Boundary-change cache eviction (tightened boundary applies lazily to
-   cached auto-route clients).
-3. MoA aggregator-listing guidance for charter authors.
-
-## Status: COMPLETE (2026-09-06)
-
 Commits ac9f1b71cc..f37154253d. Final review verdict READY — 19/19 charter
 suite, 38/38 policy suites, 53/53 objective family, 15/15 db, setup +1P/1✗
 (pre-existing), auxiliary 169✓/29✗ (byte-identical to base). Governance
