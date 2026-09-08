@@ -600,3 +600,31 @@ class TestPromotion:
 - [ ] **Step 5: Final feature regression** — full test file + skill suites + objective family; record counts; final review subagent verdict; push.
 
 Self-review note: AIAgent's real kwargs need verification in Task 3 (the sketch may not match run_agent.py's current __init__ — the implementer MUST read the real signature and adapt; if the real agent is impractical in-sandbox, the seam stays monkeypatched in tests and the real path is smoke-tested manually, documented honestly). The manifest is intentionally read-only text checks for slice 1; command-based expectations (verify: cmd) are a follow-up — do NOT add them now (YAGNI + shell-exec in eval is a security surface requiring its own design).
+
+## Status: COMPLETE (2026-09-06)
+
+Commits 718be699ad..6f632f7687. Final review verdict READY — 29/29 evolution
+suite, 129 skill-manager, 90 skills-tool, 10/10 cross-feature policy sanity.
+Governance traced on the riskiest lines: gate ordering G1→G2→G3 (fail-closed
+path resolution incl. symlink-redirect defense; all gate helpers re-asserted
+on the promote path with resolve()-equality identity check), promotion
+ordering (snapshot → staging copy → atomic replace → best-effort rmtree;
+crash windows leave only benign states — stale candidate re-evaluates before
+any promotion), sandbox escape (candidate tree excluded from copytree;
+content-copy overlay; no link preservation).
+
+A plan-defect was caught and fixed en route: the plan's sandbox test had a
+cross-call assertion error; the implementer's cache-based adaptation was
+rejected (leaks tmpdirs, breaks concurrency) and corrected to per-call
+mkdtemp isolation. Also: strict manifest schema (both-gates rejection,
+duplicate-YAML-key refusal, unknown-key rejection) hardened before any
+downstream consumer.
+
+Follow-ups (non-blocking):
+1. Model-facing schema decision for evolve (engine-invoked only this slice).
+2. Echo the backup-disabled-never-promotes coupling in curator/backup docs.
+3. Real-agent smoke test for _build_eval_agent's allowlist confinement.
+4. Command-based expectations — deferred, documented security surface.
+5. _is_path_redirect fail-open on OSError — consider fail-closed.
+6. evaluate_and_promote has no production caller yet — wiring decision
+   (engine loop vs cron vs curator) pending.
