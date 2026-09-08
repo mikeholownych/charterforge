@@ -613,6 +613,15 @@ No. Each profile has its own memory store, session database, and skills director
 
 `hermes update` pulls the latest code and reinstalls dependencies **once** (not per-profile). It then syncs updated skills to all profiles automatically. You only need to run `hermes update` once — it covers every profile on the machine.
 
+After the pull and dependency sync, and **before** the gateway/fleet restart phases, the update runs a **post-update canary**: a bounded functional smoke of the new code tree.
+
+- **What it checks** — two subprocess-isolated checks:
+  1. `core_imports` — imports the same critical file set the syntax guard parses (`hermes_cli.main`, `run_agent`, `model_tools`, `cli`, and friends), exercising the cross-module dependency graph that a parse-only syntax check cannot see.
+  2. `entry_point` — runs `python -m hermes_cli.main --version` to prove the real console entry point dispatches.
+- **Bounded runtime** — each check is capped at 30 seconds and the whole canary at ~60 seconds. A check that exceeds its budget fails closed (counts as a failure), so a hung import can never stall the update indefinitely.
+- **Fail → rollback** — a failed canary rolls the code tree back to the pre-pull SHA and exits with an error, the same contract as the pre-existing syntax guard but one level deeper. One caveat: dependency sync is **not** re-run after the rollback, so the venv may briefly hold dependencies synced to the newer `pyproject.toml` while the code is at the older SHA. Re-running `hermes update` (or any dependency reinstall) realigns them.
+- **Skipping it** — set `updates.post_update_canary: false` in `config.yaml`. The skip is recorded explicitly in the update receipt rather than happening silently.
+
 
 ### How many profiles can I run?
 

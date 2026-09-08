@@ -3650,6 +3650,9 @@ DEFAULT_CONFIG = {
         # upstream installer is not appropriate for the machine, for example
         # on non-admin accounts where `/Applications` is not writable.
         "refresh_cua_driver": True,
+        # Functional smoke (imports + entry point) after the code swap;
+        # fail → auto-rollback to the pre-pull version.
+        "post_update_canary": True,
     },
 
     # Language Server Protocol — semantic diagnostics from real
