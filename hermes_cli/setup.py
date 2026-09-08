@@ -4229,6 +4229,47 @@ def setup_agentic_settings(config: dict):
     elif isinstance(blocked_decision, dict):
         current["blocked_outcome_policy"] = blocked_decision
 
+    authorized_providers = None
+    try:
+        authorize_providers = prompt_yes_no(
+            "Restrict auxiliary model providers to an authorized list?",
+            bool(current.get("authorized_providers")),
+        )
+        if authorize_providers:
+            existing_providers = current.get("authorized_providers")
+            default_csv = ",".join(
+                str(provider).strip()
+                for provider in existing_providers or []
+                if str(provider).strip()
+            )
+            for _attempt in range(2):
+                providers_raw = prompt(
+                    "Authorized providers (comma-separated slugs, "
+                    "e.g. nous,openrouter)",
+                    default_csv,
+                )
+                # validate_charter requires a list of non-empty strings;
+                # _parse_csv_values strips, dedupes, and drops empties.
+                authorized_providers = [
+                    slug for slug in _parse_csv_values(providers_raw) if slug
+                ]
+                if authorized_providers:
+                    break
+                print_warning(
+                    "Enter at least one provider slug (comma-separated)."
+                )
+                authorized_providers = None
+    except StopIteration:
+        # The answer stream is exhausted (canned or non-interactive run):
+        # leave the charter untouched so validate_charter's absent-key
+        # unrestricted default applies.
+        authorized_providers = None
+
+    if authorized_providers:
+        current["authorized_providers"] = authorized_providers
+    else:
+        current.pop("authorized_providers", None)
+
     validate_charter(current)
     config["agentic"] = current
     _bootstrap_agentic_business(current)

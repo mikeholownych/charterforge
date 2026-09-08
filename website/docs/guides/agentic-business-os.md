@@ -411,6 +411,34 @@ audited, never reported as completed. Two boundaries are absolute:
 Both the replan and the abandonment are recorded in the business audit
 with the plan/verification evidence and the active policy version.
 
+## Auxiliary provider authority
+
+By default the auxiliary model stack (planning, judging, compression) may
+fail over to any configured provider. A charter can fence that:
+
+```yaml
+agentic:
+  authorized_providers: ["nous", "openrouter"]
+```
+
+While this charter governs the runtime, auxiliary calls are restricted to
+these providers — task fallback chains skip unauthorized candidates, and a
+pinned primary outside the list is refused outright
+(`AuxiliaryProviderNotAuthorized`, fail-closed: the call is recorded as
+`authority_refused` in the planner evidence, never silently rerouted).
+
+Boundaries of the fence, stated plainly:
+
+- Omitted or empty list = unrestricted (today's behavior).
+- The fence covers task fallback chains and pinned primaries (auto and
+  explicit routes). Three auxiliary fallback ladders (main-agent chain,
+  payment fallback, discovery chain) are not yet fenced — tracked as
+  follow-up work; do not treat them as authorized surfaces.
+- An `auto` primary is not re-judged per call, and a cached route client
+  keeps serving until cache eviction; a tightened boundary applies
+  immediately to fallback chains, lazily to cached primaries.
+- Provider names are compared case-insensitively after whitespace trim.
+
 ## Closed-loop strategy measurement
 
 Charterforge stores KPI definitions, observations, targets, strategy experiments,
