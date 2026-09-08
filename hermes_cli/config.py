@@ -2760,6 +2760,14 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Autonomous skill evolution — let the agent improve its OWN skills
+        # via skill_manage(action="evolve"): stage a candidate in
+        # <skill>/.candidate/, evaluate it against the skill's .evals.yaml
+        # manifest inside an isolated sandbox, and promote only on a passing
+        # verdict (a curator rollback snapshot is taken before the swap).
+        # Off by default: an agent rewriting its own instructions is a
+        # deliberate opt-in.
+        "autonomous_evolution": False,
     },
 
     # Curator — background skill maintenance.

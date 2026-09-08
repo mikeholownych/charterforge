@@ -494,3 +494,42 @@ class TestPromotion:
         result = se.evaluate_and_promote(agent_skill)
         assert result["promoted"] is False
         assert "created_by" in json.dumps(result)
+
+    def test_swap_failure_keeps_everything(self, agent_skill, monkeypatch):
+        """os.replace failure: live untouched, candidate preserved, promoted
+        False with an error."""
+        from agent import skill_evolution as se
+        import hermes_cli.config as config_mod
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": True}},
+        )
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+        (agent_skill / ".candidate").mkdir(exist_ok=True)
+        (agent_skill / ".candidate" / "SKILL.md").write_text(
+            "# IMPROVED\n\nstep one, verify output. Retry once.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "agent.curator_backup.snapshot_skills",
+            lambda reason="manual", **k: Path("/tmp/fake.tgz"),
+        )
+        class _FakeAgent:
+            def __init__(self, *a, **k): pass
+            def chat(self, message, **k): return "steps, verify, retry once"
+        monkeypatch.setattr(se, "_build_eval_agent", lambda skills_dir: _FakeAgent())
+        real_replace = __import__("os").replace
+
+        def exploding_replace(src, dst):
+            if str(dst).endswith("SKILL.md"):
+                raise OSError("EBUSY simulated")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr("agent.skill_evolution.os.replace", exploding_replace)
+        result = se.evaluate_and_promote(agent_skill)
+        assert result["promoted"] is False
+        assert "error" in result
+        live = (agent_skill / "SKILL.md").read_text(encoding="utf-8")
+        assert "IMPROVED" not in live
+        assert (agent_skill / ".candidate" / "SKILL.md").is_file()

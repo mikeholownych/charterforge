@@ -439,6 +439,49 @@ Boundaries of the fence, stated plainly:
   immediately to fallback chains, lazily to cached primaries.
 - Provider names are compared case-insensitively after whitespace trim.
 
+## Skill evolution
+
+Agent-authored skills can improve themselves under a default-off gate. The
+lifecycle: propose → stage → evaluate in isolation → promote with a rollback
+snapshot.
+
+Enable it in config.yaml:
+
+```yaml
+skills:
+  autonomous_evolution: true
+```
+
+- **Stage.** `skill_manage(action="evolve", ...)` writes the improved skill
+  to `<skill>/.candidate/SKILL.md` — the live skill is never touched by a
+  proposal. Only skills the agent itself authored (`created_by: agent` in
+  the usage sidecar) are eligible; bundled and hub skills are refused.
+- **Evaluate.** The candidate runs against the skill's `.evals.yaml`
+  manifest (prompt + checkable-expectation pairs) inside a sandbox skills
+  dir containing only the candidate. The evaluation agent is confined:
+  no delegation, cron, terminal, browser, or web toolsets.
+- **Promote.** Only a passing evaluation promotes — and only after a
+  curator backup snapshot (rollback). A failing or errored evaluation keeps
+  the incumbent and preserves the candidate for human review. If backups
+  are disabled, promotion is refused: no rollback path, no promotion.
+
+Manifest format (`.evals.yaml` beside SKILL.md):
+
+```yaml
+version: 1
+prompts:
+  - prompt: "Summarize the quick-reference table."
+    expect:
+      contains: ["step", "verify"]
+  - prompt: "What does the skill say about failure handling?"
+    expect:
+      regex: "(?i)fail|retry|rollback"
+```
+
+Expectations are text checks for this first slice; command-based
+verification is deliberately not implemented (it is a security surface
+needing its own design).
+
 ## Closed-loop strategy measurement
 
 Charterforge stores KPI definitions, observations, targets, strategy experiments,
