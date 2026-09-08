@@ -31,6 +31,22 @@ from agent.codex_headers import (
     is_official_codex_base_url as _is_official_codex_base_url,
 )
 
+class AuxiliaryProviderNotAuthorized(RuntimeError):
+    """Raised fail-closed when a charter's authorized_providers boundary
+    leaves no admissible auxiliary provider for a governed call."""
+
+    def __init__(self, *, task: str, attempted: list, authorized: frozenset):
+        self.task = task
+        self.attempted = list(attempted)
+        self.authorized = set(authorized)
+        super().__init__(
+            f"auxiliary task {task!r}: attempted providers "
+            f"{self.attempted} are outside the charter's authorized "
+            f"providers {sorted(self.authorized)} — call refused "
+            f"(fail-closed authority boundary)"
+        )
+
+
 # `openai.OpenAI` is imported lazily (~240 ms cold); `OpenAI` below is a proxy
 # so in-module calls, `auxiliary_client.OpenAI` reads and
 # `patch("agent.auxiliary_client.OpenAI")` all keep working.

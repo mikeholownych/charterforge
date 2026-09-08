@@ -123,6 +123,16 @@ def validate_charter(charter: Mapping[str, Any]) -> None:
                     "agentic.blocked_outcome_policy.abandon_after_max must be a "
                     "boolean"
                 )
+    authorized = charter.get("authorized_providers")
+    if authorized is not None:
+        if not isinstance(authorized, list) or any(
+            not isinstance(entry, str) or not entry.strip()
+            for entry in authorized
+        ):
+            raise ValueError(
+                "agentic.authorized_providers must be a list of non-empty "
+                "provider names"
+            )
     from hermes_cli import resource_budget
 
     resource_limits = {
@@ -156,6 +166,22 @@ def validate_charter(charter: Mapping[str, Any]) -> None:
             "agentic.resource_limits planner call reservation exceeds "
             "the objective compute ceiling"
         )
+
+
+def authorized_auxiliary_providers(
+    charter: Mapping[str, Any],
+) -> Optional[frozenset[str]]:
+    """Providers auxiliary calls may use while this charter governs the
+    runtime, normalized to lowercase; None when the charter does not restrict
+    providers (absent/disabled charter or empty list = unrestricted)."""
+    if not isinstance(charter, Mapping) or not bool(charter.get("enabled", False)):
+        return None
+    listed = charter.get("authorized_providers")
+    if not isinstance(listed, list) or not listed:
+        return None
+    return frozenset(
+        str(entry).strip().lower() for entry in listed if str(entry).strip()
+    )
 
 
 def evaluate_action(
