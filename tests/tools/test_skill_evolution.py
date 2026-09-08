@@ -39,6 +39,9 @@ def agent_skill(tmp_path, monkeypatch):
                      "view_count": 0, "patch_count": 0},
     }), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Fixture is shared across all four task groups: HERMES_HOME pins
+    # get_skills_dir() for staging/eval/promotion; the usage record feeds
+    # the provenance gate. Task 1's loader takes skill_dir explicitly.
     return skills
 
 
@@ -86,3 +89,62 @@ class TestManifestLoader:
         )
         with pytest.raises(EvalManifestError, match="version"):
             load_eval_manifest(agent_skill)
+
+    def test_invalid_yaml_raises(self, agent_skill):
+        from agent.skill_evolution import load_eval_manifest, EvalManifestError
+
+        (agent_skill / ".evals.yaml").write_text(
+            "version: 1\nprompts: [unclosed\n", encoding="utf-8"
+        )
+        with pytest.raises(EvalManifestError, match="not valid YAML|invalid YAML"):
+            load_eval_manifest(agent_skill)
+
+    def test_non_mapping_yaml_raises(self, agent_skill):
+        from agent.skill_evolution import load_eval_manifest, EvalManifestError
+
+        (agent_skill / ".evals.yaml").write_text(
+            "- just\n- a\n- list\n", encoding="utf-8"
+        )
+        with pytest.raises(EvalManifestError, match="mapping"):
+            load_eval_manifest(agent_skill)
+
+    def test_both_expectations_rejected(self, agent_skill):
+        from agent.skill_evolution import load_eval_manifest, EvalManifestError
+
+        (agent_skill / ".evals.yaml").write_text(
+            "version: 1\nprompts:\n  - prompt: 'x'\n    expect:\n"
+            "      contains: ['step']\n      regex: 'step'\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(EvalManifestError, match="only one of"):
+            load_eval_manifest(agent_skill)
+
+    def test_unknown_expect_key_rejected(self, agent_skill):
+        from agent.skill_evolution import load_eval_manifest, EvalManifestError
+
+        (agent_skill / ".evals.yaml").write_text(
+            "version: 1\nprompts:\n  - prompt: 'x'\n    expect:\n"
+            "      contains: ['step']\n      min_score: 0.9\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(EvalManifestError, match="unknown|unsupported"):
+            load_eval_manifest(agent_skill)
+
+    def test_duplicate_yaml_keys_rejected(self, agent_skill):
+        from agent.skill_evolution import load_eval_manifest, EvalManifestError
+
+        (agent_skill / ".evals.yaml").write_text(
+            "version: 1\nprompts:\n  - prompt: 'a'\n    expect:\n"
+            "      contains: ['step']\n"
+            "prompts:\n  - prompt: 'b'\n    expect:\n      regex: 'x'\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(EvalManifestError, match="duplicate|YAML"):
+            load_eval_manifest(agent_skill)
+
+    def test_fixture_comment_and_existing_suite_still_green(self, agent_skill):
+        """Existing valid manifest still loads (strict keys don't reject it)."""
+        from agent.skill_evolution import load_eval_manifest
+
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+        assert load_eval_manifest(agent_skill)["version"] == 1
