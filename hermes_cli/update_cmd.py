@@ -735,6 +735,61 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
     sys.exit(1)
 
 
+def _run_post_update_canary(pre_pull_sha: str, git_cmd) -> None:
+    """Post-dependency-sync functional smoke: import-probes the critical-file set
+    plus the entry point in subprocess isolation (one level deeper than the syntax
+    guard — imports exercise the cross-module dep graph a parse cannot see).
+    Fail → roll back to *pre_pull_sha* (same contract as the syntax guard) and
+    ``sys.exit(1)``. ``updates.post_update_canary`` gates it (default ON; a skip
+    is explicit and recorded)."""
+    from hermes_cli import update_canary
+    try:
+        enabled = bool(_updates_config().get("post_update_canary", True))
+    except Exception:
+        enabled = True  # config unreadable: default ON (fail-closed canary)
+    if not enabled:
+        _record_update_step(
+            "post_update_canary", None,
+            "skipped by updates.post_update_canary=false")
+        return
+    print("→ Running post-update canary...")
+    result = update_canary.run_canary(
+        project_root=_m().PROJECT_ROOT, python_exe=sys.executable)
+    for check in result["checks"]:
+        mark = "✓" if check["ok"] else "✗"
+        detail = f" — {check['detail']}" if check["detail"] else ""
+        print(f"  {mark} {check['name']}{detail}")
+    _record_update_step(
+        "post_update_canary", result["verdict"] == "pass",
+        f"verdict={result['verdict']} duration={result['duration_seconds']}s")
+    if result["verdict"] == "pass":
+        return
+    print()
+    print("✗ Pulled code failed the post-update canary:")
+    for check in result["checks"]:
+        if not check["ok"]:
+            print(f"  {check['name']}: {check['detail']}")
+    print()
+    if pre_pull_sha:
+        print(f"→ Rolling back to {pre_pull_sha[:10]}...")
+        rollback_result = _git_run(git_cmd, ["reset", "--hard", pre_pull_sha])
+        if rollback_result.returncode == 0:
+            print("  ✓ Rollback complete — your install is unchanged.")
+            print("  Try ``hermes update`` again later once a fix lands.")
+        else:
+            print("  ✗ Rollback failed. Recover manually with:")
+            print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
+            if rollback_result.stderr.strip():
+                print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
+        _record_update_step(
+            "post_update_canary_rollback", rollback_result.returncode == 0,
+            f"reset --hard {pre_pull_sha[:10]}")
+    else:
+        print("  Could not capture pre-pull SHA — recover manually with:")
+        print(f"    cd {_m().PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
+    sys.exit(1)
+
+
 def _pull_updates(
     git_cmd, branch, auto_stash_ref, *, prompt_for_restore, gw_input_fn, discard_local_changes,
     keep_stash):
@@ -1192,6 +1247,11 @@ def _apply_pulled_update(
         git_cmd, branch, pre_pull_sha, active_lazy_features=opts.active_lazy_features,
         active_tool_dependencies=opts.active_tool_dependencies,
         _windows_gateway_resume=_windows_gateway_resume)
+
+    # Canary AFTER the dep sync (probes must exercise the new deps, not stale
+    # ones) and BEFORE any gateway/fleet restart: a broken pulled tree must
+    # never be restarted into. Fail → reset --hard pre_pull_sha + exit 1.
+    _run_post_update_canary(pre_pull_sha, git_cmd)
 
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
