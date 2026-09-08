@@ -411,3 +411,22 @@ class TestPlannerAuthorityEvidence:
 - Full feature diff review (scope, invariants traced), all suite runs, follow-up list (payment-fallback/discovery-chain coverage under boundary — flag if those paths bypass the task-chain filter; decide follow-up vs in-scope).
 
 Self-review note: the plan's Task 2 must NOT claim coverage of `_try_main_fallback_chain`, `_try_payment_fallback`, `_try_discovery_chain` — those read the MAIN agent's fallback config and the discovery chain, which are outside the task's chain. Either route them through the same boundary check (recommended: one shared `_boundary_allows(provider)` predicate called at each candidate-acceptance site) or explicitly scope the feature to task chains + primary and record the rest as follow-ups. The implementer should make the shared predicate the core deliverable and apply it at as many acceptance sites as cleanly reachable, documenting exactly which sites are covered.
+
+## Status: COMPLETE (2026-09-06)
+
+Commits ac9f1b71cc..f37154253d. Final review verdict READY — charter suite
+19/19, policy suites 10+28, objective family 26+27, objectives_db 15/15,
+auxiliary suite failure set byte-identical to base. Governance contract
+traced on the riskiest lines: explicit-branch boundary check fires on the
+wire provider (post-MoA-unwrap) before client build; fail-closed condition
+(unauthorized_attempted and not tried) with the skip taxonomy documented;
+authority_refused propagates end-to-end into durable planner_inferences
+evidence (validation set widened — production masking bug caught in RED).
+
+Follow-ups (non-blocking):
+1. Three unfenced auxiliary ladders (main-chain, payment, discovery) +
+   the vision branch — same _boundary_allows predicate at those acceptance
+   sites; guide already says "do not treat them as authorized surfaces".
+2. Boundary-change cache eviction (tightened boundary applies lazily to
+   cached auto-route clients).
+3. MoA aggregator-listing guidance for charter authors.
