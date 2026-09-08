@@ -916,6 +916,11 @@ class Task:
     # model (pre-existing behaviour). Solves the "model from provider A,
     # profile configured for provider B" mismatch class.
     provider_override: Optional[str] = None
+    # Per-task reasoning effort for the worker (VALID_REASONING_EFFORTS or
+    # "none" for thinking off). When set, the dispatcher passes
+    # --reasoning <level> so the worker runs at that depth regardless of the
+    # profile's agent.reasoning_effort. None = profile setting.
+    reasoning_effort: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1026,6 +1031,11 @@ class Task:
             ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
+            ),
+            reasoning_effort=(
+                row["reasoning_effort"]
+                if "reasoning_effort" in keys and row["reasoning_effort"]
+                else None
             ),
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
@@ -1193,6 +1203,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- worker resolves the model against the right backend instead of the
     -- profile's configured provider. NULL = profile provider.
     provider_override    TEXT,
+    -- Per-task reasoning effort for the worker (minimal|low|medium|high|
+    -- xhigh|max|ultra, or 'none' for thinking off). When set, the dispatcher
+    -- passes --reasoning <level> so the worker runs at that depth regardless
+    -- of the profile's agent.reasoning_effort. NULL = profile setting.
+    reasoning_effort     TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2378,6 +2393,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # provider resolves the model (the behaviour existing rows had).
         _add_column_if_missing(
             conn, "tasks", "provider_override", "provider_override TEXT"
+        )
+
+    if "reasoning_effort" not in cols:
+        # Per-task reasoning effort for the worker (VALID_REASONING_EFFORTS
+        # or "none"). NULL = inherit the profile's agent.reasoning_effort,
+        # which is the behaviour existing rows had before the column existed.
+        _add_column_if_missing(
+            conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
         )
 
     if "goal_mode" not in cols:
