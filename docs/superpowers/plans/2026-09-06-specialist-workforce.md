@@ -368,3 +368,25 @@ class TestDispatcherWiring:
 Full-range diff review against the governance contract (fail-open routing, roster honesty, read-only injection, no capacity/reclaim changes), all suite runs, follow-up list (pre-warming, auto-scaling, worker-driven learning writes — deliberately deferred).
 
 Self-review note: `route_task` returns None when disabled (caller unchanged) vs default_assignee when enabled-but-failed — the two None-vs-default semantics are load-bearing for the dispatcher wiring; the implementer must keep them distinct and test both. The roster source premise check is the highest-risk adaptation in Task 1; if no JSON roster exists, the implementer defines the roster read from the real profile store and adapts the fixture to patch that reader — tests stay authoritative.
+
+## Status: COMPLETE (2026-09-06)
+
+Commits 7a50b7b926..289ddb7b5e. Final review verdict READY — 23/23
+specialist suite, 4+16 worker_argv/promote, 229+1(pre-existing) kanban_db,
+29/29 skill-evolution cross-sanity. Governance traced: hook inside
+`if not row_assignee:` (explicit assignments structurally unreachable),
+breaker attempted-flag (disabled never calls route_task; max 1 aux call/tick
+under failure), learnings injection fail-open (base prompt on any error),
+reasoning_effort upstream-verbatim restore unblocked real spawns (the
+adoption had dropped the field — every spawn AttributeError'd).
+
+MAJOR baseline repair surfaced by wiring: the module split had dropped ~14
+late-bound helpers (_host_prefix, _env_int, _git_out, lifecycle-hook
+plumbing, ...) — every dispatch tick AttributeError'd on the pristine tree.
+Restored verbatim (verified against e03a680592^, 10 byte-identical).
+
+Follow-ups (non-blocking): unfenced-ladder coverage matrix entry for the
+kanban_specialist task; MoA guidance; per-tick time budget for successful
+routings; _apply_default_assignee rowcount truthfulness; baseline-repair
+queue (DispatchResult duplication, _wal_fallback_warned_paths,
+request_review, observability module).
