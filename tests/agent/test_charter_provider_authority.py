@@ -208,6 +208,45 @@ class TestChokePointFiltering:
                 "objective_planner", "auto", reason="test"
             )
 
+    def test_backend_skipped_authorized_entry_semantics(
+        self, monkeypatch, resolve_recorder
+    ):
+        """[unauthorized, authorized-but-backend-skipped] under boundary {nous}:
+        the kept-but-skipped authorized entry never reaches `tried`, so the
+        typed refusal fires (documented semantics — blocks fall-through into
+        unfiltered chains in the partial-coverage state)."""
+        import hermes_cli.config as config_mod
+        from agent import auxiliary_client as aux
+
+        monkeypatch.setattr(
+            config_mod, "load_config_readonly",
+            lambda: {"auxiliary": {"objective_planner": {"fallback_chain": [
+                {"provider": "openrouter", "model": "m-open"},
+                {"provider": "nous", "model": "m-nous"},
+            ]}}},
+        )
+        import hermes_cli.objective_policy as op
+
+        monkeypatch.setattr(
+            op, "authorized_auxiliary_providers",
+            lambda charter=None: frozenset({"nous"}),
+        )
+        # Simulate the nous entry being backend-skipped (e.g. it IS the
+        # failed primary): _failed_backend_skip returns True for it.
+        monkeypatch.setattr(
+            aux, "_failed_backend_skip",
+            lambda failed_provider, failed_model: (
+                lambda provider, model, base_url="": provider.lower() == "nous"
+            ),
+        )
+        with pytest.raises(aux.AuxiliaryProviderNotAuthorized) as excinfo:
+            aux._try_configured_fallback_chain(
+                "objective_planner", "nous", reason="test",
+                failed_model="m-nous",
+            )
+        assert excinfo.value.attempted == ["openrouter"]
+        assert resolve_recorder == []  # nothing was resolved
+
     def test_no_charter_is_unchanged(self, monkeypatch, resolve_recorder):
         """Boundary None → original behavior: both entries resolved in
         order, first success returns."""
@@ -233,3 +272,66 @@ class TestChokePointFiltering:
         assert resolve_recorder == ["openrouter"]
         assert client is not None
         assert "openrouter" in label
+
+
+class TestPrimaryBoundary:
+    def test_auto_route_pinned_unauthorized_primary_raises(self, monkeypatch):
+        """Auto route with a pinned unauthorized wire primary → typed raise
+        before any client build."""
+        from agent import auxiliary_client as aux
+        import hermes_cli.config as config_mod
+        import hermes_cli.objective_policy as op
+
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {})
+        monkeypatch.setattr(
+            op, "authorized_auxiliary_providers",
+            lambda charter=None: frozenset({"nous"}),
+        )
+        # Stub the route target to return a pinned unauthorized provider.
+        monkeypatch.setattr(
+            aux, "_main_route_target",
+            lambda runtime, task: ("openrouter", "m", "https://x", "key", None),
+        )
+        # If the raise happened before _try_main_provider_route, this must
+        # never be reached; explode if it is.
+        monkeypatch.setattr(
+            aux, "_try_main_provider_route",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("client must not be built for unauthorized primary")
+            ),
+        )
+        with pytest.raises(aux.AuxiliaryProviderNotAuthorized) as excinfo:
+            aux._resolve_auto_route({}, task="objective_planner")
+        assert excinfo.value.attempted == ["openrouter"]
+
+    def test_explicit_provider_unauthorized_raises(self, monkeypatch):
+        """auxiliary.<task>.provider pinned to an unauthorized provider →
+        typed raise at the explicit branch of _resolve_call_client, no client
+        build (resolve_provider_client never called)."""
+        from agent import auxiliary_client as aux
+        import hermes_cli.config as config_mod
+        import hermes_cli.objective_policy as op
+
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {})
+        monkeypatch.setattr(
+            op, "authorized_auxiliary_providers",
+            lambda charter=None: frozenset({"nous"}),
+        )
+        monkeypatch.setattr(
+            aux, "resolve_provider_client",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError(
+                    "client must not be built for unauthorized explicit primary"
+                )
+            ),
+        )
+        with pytest.raises(aux.AuxiliaryProviderNotAuthorized) as excinfo:
+            aux._resolve_call_client(
+                task="objective_planner", provider="openrouter", model="m",
+                base_url=None, api_key=None,
+                resolved_provider="openrouter", resolved_model="m",
+                resolved_base_url=None, resolved_api_key=None,
+                resolved_api_mode=None, main_runtime=None, async_mode=False,
+            )
+        assert excinfo.value.attempted == ["openrouter"]
+        assert excinfo.value.authorized == {"nous"}

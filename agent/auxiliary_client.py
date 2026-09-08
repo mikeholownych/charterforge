@@ -48,20 +48,28 @@ class AuxiliaryProviderNotAuthorized(RuntimeError):
         )
 
 
-def _boundary_allows(provider: str, boundary: Optional[frozenset]) -> bool:
+# Sentinel for call sites that must degrade an absent/None-y boundary to
+# "authorize nothing" without allocating a fresh frozenset each call.
+_EMPTY_AUTHORIZED: frozenset = frozenset()
+
+
+def _boundary_allows(provider: str, boundary: frozenset) -> bool:
     """Charter authority predicate: canonical strip+lower on BOTH sides, so
     neither the configured provider label nor the charter list needs case
     normalization at call sites. Consumers must treat a set boundary as
     authoritative only via ``boundary is not None`` (never truthiness) — an
     EMPTY frozenset authorizes nothing and must fail closed.
 
-    Covered sites (Task 2): the task ``fallback_chain`` filter in
-    ``_try_configured_fallback_chain`` and the pinned-primary acceptance
-    check in ``_resolve_auto_route``. NOT yet covered (documented follow-up,
-    deliberately out of scope here): ``_try_main_fallback_chain``,
-    ``_try_payment_fallback``, and ``_try_discovery_chain``.
+    Covered sites: the task ``fallback_chain`` filter in
+    ``_try_configured_fallback_chain``, the pinned-primary acceptance check in
+    ``_resolve_auto_route``, and the explicit-provider primary acceptance check
+    in ``_resolve_call_client`` (non-vision branch). NOT yet covered
+    (documented follow-up, deliberately out of scope here):
+    ``_try_main_fallback_chain``, ``_try_payment_fallback``, and
+    ``_try_discovery_chain``; the vision branch routes through
+    ``resolve_vision_provider_client`` and is likewise uncovered.
     """
-    return str(provider or "").strip().lower() in (boundary or frozenset())
+    return str(provider or "").strip().lower() in (boundary or _EMPTY_AUTHORIZED)
 
 
 def _charter_provider_boundary() -> Optional[frozenset]:
@@ -77,6 +85,11 @@ def _charter_provider_boundary() -> Optional[frozenset]:
         charter = (load_config_readonly() or {}).get("agentic") or {}
         return authorized_auxiliary_providers(charter)
     except Exception:
+        logger.warning(
+            "auxiliary: cannot read charter authorized_providers — "
+            "failing_open=unrestricted this call",
+            exc_info=True,
+        )
         return None
 
 
@@ -4012,6 +4025,26 @@ def _try_configured_fallback_chain(
     # failed to build or screened too-small). If an authorized entry WAS
     # tried and failed, ``tried`` is non-empty — that is ordinary chain
     # exhaustion, not an authority refusal.
+    #
+    # Skip taxonomy — where a candidate can leave this loop without a result:
+    #   - unauthorized-filter: dropped by the choke-point filter above,
+    #     recorded in ``unauthorized_attempted``, never in ``tried``.
+    #   - backend-skip: kept by the filter but skipped by the
+    #     ``_failed_backend_skip`` predicate (it IS the failed primary, or a
+    #     sibling model of a model-scoped failure) — recorded in neither list.
+    #   - build-fail: ``_resolve_fallback_entry`` raised or returned None —
+    #     recorded in ``tried``.
+    #   - too-small: context-window screening rejected it — recorded in
+    #     ``tried``.
+    # Chosen semantics (behavior pinned, NOT changed here): the typed raise
+    # fires exactly when ``unauthorized_attempted and not tried`` — i.e. when
+    # every candidate the filter KEPT was backend-skipped or otherwise failed
+    # without ever reaching ``tried``. Ladder-path consequence: an authorized
+    # primary whose payment/timeout failure defers into this chain is
+    # re-branded as an authority refusal when the kept authorized entries are
+    # all backend-skipped and the rest of the chain is unauthorized — that
+    # error branding is accepted in the partial-coverage state and should be
+    # revisited with the coverage follow-up (see _boundary_allows docstring).
     if boundary is not None and unauthorized_attempted and not tried:
         raise AuxiliaryProviderNotAuthorized(
             task=task, attempted=unauthorized_attempted, authorized=boundary
@@ -4246,6 +4279,13 @@ def _resolve_auto_route(
     # provider (fast-model / MoA aggregator resolution) is what is judged.
     # Auto primary is out of scope here by design: the fallback chains below
     # filter their own candidates against the same boundary.
+    #
+    # Cache lifetime: a tightened charter boundary re-reads and re-filters the
+    # fallback chains on every walk, but an ALREADY-built auto-route client is
+    # served from ``_get_cached_client``'s cache without re-judging until
+    # cache eviction — tightening the boundary does not retroactively refuse
+    # a cached auto-route primary in flight (documented; flagged as a
+    # follow-up so eventual eviction is honored rather than left implicit).
     boundary = _charter_provider_boundary()
     pinned = str(main_provider or "").strip()
     if (
@@ -6586,6 +6626,29 @@ def _resolve_call_client(
         if client is not None:
             resolved_provider = effective_provider or resolved_provider
     else:
+        # Explicit-provider primary acceptance check: `resolved_provider` is
+        # the wire provider here — the MoA facade unwrap and direct-API
+        # aliasing (provider: openai → custom) already happened in
+        # _resolve_task_provider_model before this function, so this is
+        # exactly the provider resolve_provider_client would be called for.
+        # Mirrors _resolve_auto_route's pinned-primary acceptance check:
+        # refuse BEFORE any client build when the charter sets an
+        # authorized-provider boundary. ``boundary is None`` (no charter /
+        # disabled / empty list) leaves this function byte-identical in
+        # behavior for the many providers that are not charter-governed.
+        boundary = _charter_provider_boundary()
+        pinned = str(resolved_provider or "").strip()
+        if (
+            boundary is not None
+            and pinned
+            and pinned.lower() != "auto"
+            and not _boundary_allows(pinned, boundary)
+        ):
+            raise AuxiliaryProviderNotAuthorized(
+                task=task or "<explicit>",
+                attempted=[pinned],
+                authorized=boundary,
+            )
         client, final_model = _get_cached_client(
             resolved_provider, resolved_model, async_mode=async_mode, base_url=resolved_base_url,
             api_key=resolved_api_key, api_mode=resolved_api_mode, main_runtime=main_runtime,
