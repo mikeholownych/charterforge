@@ -42,6 +42,8 @@ def _roster_entries(roster: Any) -> list[dict]:
     profiles: Any = []
     if isinstance(roster, dict):
         profiles = roster.get("profiles") or []
+    if not isinstance(profiles, list):
+        profiles = []
     entries: list[dict] = []
     for profile in profiles:
         if isinstance(profile, str):
@@ -71,7 +73,7 @@ def _format_roster_lines(entries: list[dict]) -> str:
 
 
 def _load_roster() -> dict:
-    """Read the live profile roster via the decompose reader (premise (a)).
+    """Read the live profile roster via the decompose reader.
 
     ``hermes_cli.kanban_decompose._build_roster`` is the canonical roster
     source: it returns ``(entries, valid_names)`` with each entry shaped
@@ -93,11 +95,37 @@ def _load_roster() -> dict:
     }
 
 
-def _llm_pick_assignee(task_desc: str, roster_entries: list[dict]) -> str:
-    """Ask the auxiliary LLM to pick one roster name for the task.
+def _sanitize_pick(raw: str) -> str:
+    """Sanitize a raw LLM reply down to a plausible profile name.
 
-    Returns the stripped reply. Raises on provider failure — the caller
-    (``route_task``) owns the fail-open fallback.
+    Takes the first non-empty line, strips wrapping backticks / quotes /
+    asterisks and trailing punctuation. Deliberately does NOT split on
+    whitespace — profile names may contain spaces.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            text = stripped
+            break
+    changed = True
+    while changed:
+        changed = False
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "`\"'*":
+            text = text[1:-1].strip()
+            changed = True
+        while text and text[-1] in ".,;:!":
+            text = text[:-1].rstrip()
+            changed = True
+    return text.strip()
+
+
+def _llm_raw_pick(task_desc: str, roster_entries: list[dict]) -> str:
+    """Raw auxiliary-LLM call: returns the stripped reply text.
+
+    Raises on provider failure — the caller owns the fail-open fallback.
     """
     from agent.auxiliary_client import call_llm
 
@@ -121,17 +149,40 @@ def _llm_pick_assignee(task_desc: str, roster_entries: list[dict]) -> str:
     return raw.strip()
 
 
+def _llm_pick_assignee(task_desc: str, roster_entries: list[dict]) -> str:
+    """Ask the auxiliary LLM to pick one roster name for the task.
+
+    Returns a sanitized reply (see :func:`_sanitize_pick`) — LLMs often
+    wrap picks in backticks/quotes/asterisks or append punctuation and
+    explanations. Raises on provider failure — the caller (``route_task``)
+    owns the fail-open fallback.
+    """
+    return _sanitize_pick(_llm_raw_pick(task_desc, roster_entries))
+
+
 def route_task(task_desc: str, roster: Any = None) -> Optional[str]:
     """Resolve a specialist assignee for ``task_desc``.
 
-    Returns a profile name from the roster, or None when routing is
-    disabled or impossible (the caller then uses its existing
-    ``kanban.default_assignee`` path).
+    Returns a roster-valid profile name, or None when routing cannot
+    produce one (the caller then uses its existing ``kanban.default_assignee``
+    path, which handles None with correct event semantics).
 
-    Semantics: routing disabled → None; empty roster → None; LLM error →
-    configured default_assignee; pick not in roster → default_assignee;
-    valid pick → the picked name. Any unexpected failure → None (fail-open,
-    dispatch never blocks).
+    Semantics (dual-None contract — every fallback that cannot produce a
+    spawnable name degrades to None):
+
+    ================  =============================================
+    routing disabled  None
+    empty roster      None
+    config failure    None (outer fail-open)
+    LLM error         default_assignee if it is a roster name, else None
+    unknown pick      default_assignee if it is a roster name, else None
+    valid pick        the picked name
+    ================  =============================================
+
+    Task-3 wiring note: routing runs inside the dispatch lock, so a
+    per-tick routing breaker (skip routing for the remainder of the tick
+    after the first LLM failure) is REQUIRED at wiring time to bound
+    N x 30s serial auxiliary calls per tick.
     """
     try:
         from hermes_cli import config as config_mod
@@ -145,22 +196,24 @@ def route_task(task_desc: str, roster: Any = None) -> Optional[str]:
         entries = _roster_entries(roster)
         if not entries:
             return None
+        roster_names = {entry["name"] for entry in entries}
         default = ((kanban_cfg.get("default_assignee") or "") or "").strip() or None
+        fallback = default if default in roster_names else None
         try:
             pick = _llm_pick_assignee(task_desc, entries)
         except Exception as exc:
             logger.warning(
                 "kanban specialist routing: LLM pick failed (%s); "
-                "falling back to default_assignee %r", exc, default,
+                "falling back to default_assignee %r", exc, fallback,
             )
-            return default
+            return fallback
         pick = (pick or "").strip()
-        if not pick or pick not in {entry["name"] for entry in entries}:
+        if not pick or pick not in roster_names:
             logger.info(
                 "kanban specialist routing: pick %r not in roster; "
-                "falling back to default_assignee %r", pick, default,
+                "falling back to default_assignee %r", pick, fallback,
             )
-            return default
+            return fallback
         return pick
     except Exception as exc:
         logger.warning(
