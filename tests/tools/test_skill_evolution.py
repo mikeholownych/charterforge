@@ -244,3 +244,102 @@ class TestCandidateStaging:
         candidate = agent_skill / ".candidate" / "SKILL.md"
         text = candidate.read_text(encoding="utf-8")
         assert "v2" in text and "v1" not in text
+
+
+class TestEvaluationRunner:
+    def test_run_evaluation_passes_on_satisfying_responses(
+        self, agent_skill, monkeypatch
+    ):
+        from agent import skill_evolution as se
+
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+
+        class _FakeAgent:
+            def __init__(self, *a, **k): pass
+            def chat(self, message, **k):
+                return "Follow the steps and verify the output. Retry once."
+
+        monkeypatch.setattr(se, "_build_eval_agent", lambda skills_dir: _FakeAgent())
+        result = se.run_evaluation(agent_skill)
+        assert result["verdict"] == "pass"
+        assert all(p["passed"] for p in result["prompts"])
+        assert result["manifest_version"] == 1
+
+    def test_run_evaluation_fails_on_unsatisfying_response(
+        self, agent_skill, monkeypatch
+    ):
+        from agent import skill_evolution as se
+
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+
+        class _BadAgent:
+            def __init__(self, *a, **k): pass
+            def chat(self, message, **k):
+                return "I have no idea what you mean."
+
+        monkeypatch.setattr(se, "_build_eval_agent", lambda skills_dir: _BadAgent())
+        result = se.run_evaluation(agent_skill)
+        assert result["verdict"] == "fail"
+        assert any(not p["passed"] for p in result["prompts"])
+
+    def test_sandbox_contains_only_candidate(self, agent_skill, monkeypatch):
+        from agent import skill_evolution as se
+
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+        other = agent_skill.parent / "other-skill"
+        other.mkdir()
+        (other / "SKILL.md").write_text("# other\n", encoding="utf-8")
+
+        captured = {}
+        class _SpyAgent:
+            def __init__(self, *a, **k): pass
+            def chat(self, message, **k):
+                return "steps, verify, retry"
+
+        def spy_build(skills_dir: Path):
+            captured["skills_dir"] = Path(skills_dir)
+            return _SpyAgent()
+
+        monkeypatch.setattr(se, "_build_eval_agent", spy_build)
+        se.run_evaluation(agent_skill)
+        sandbox = captured["skills_dir"]
+        names = {p.name for p in sandbox.iterdir()}
+        assert "other-skill" not in names
+        assert "my-skill" in names
+
+        (agent_skill / ".candidate").mkdir(exist_ok=True)
+        (agent_skill / ".candidate" / "SKILL.md").write_text(
+            "# CANDIDATE MARKER\n", encoding="utf-8"
+        )
+        se.run_evaluation(agent_skill)
+        assert "CANDIDATE MARKER" in (sandbox / "my-skill" / "SKILL.md").read_text(encoding="utf-8")
+
+    def test_sandbox_excludes_candidate_dir_copy(self, agent_skill, monkeypatch):
+        """The .candidate/ dir is copied over SKILL.md, NOT copied as a
+        subdirectory — the eval agent must not see two skill bodies."""
+        from agent import skill_evolution as se
+
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+        (agent_skill / ".candidate").mkdir(exist_ok=True)
+        (agent_skill / ".candidate" / "SKILL.md").write_text(
+            "# CANDIDATE\n", encoding="utf-8"
+        )
+        seen = {}
+        class _SpyAgent:
+            def __init__(self, *a, **k): pass
+            def chat(self, message, **k): return "steps, verify, retry"
+        def spy_build(skills_dir: Path):
+            seen["sandbox_skill"] = Path(skills_dir) / agent_skill.name
+            return _SpyAgent()
+        monkeypatch.setattr(se, "_build_eval_agent", spy_build)
+        se.run_evaluation(agent_skill)
+        assert not (seen["sandbox_skill"] / ".candidate").exists()
+        assert "CANDIDATE" in (seen["sandbox_skill"] / "SKILL.md").read_text(encoding="utf-8")
+
+    def test_missing_manifest_fails_closed(self, agent_skill):
+        from agent import skill_evolution as se
+
+        result = se.run_evaluation(agent_skill)
+        assert result["verdict"] == "error"
+        assert "no .evals.yaml" in result.get("error", "")
+        assert result["prompts"] == []

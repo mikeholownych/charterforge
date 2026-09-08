@@ -3,8 +3,11 @@ evaluation, controlled promotion. Default OFF; agent-authored skills only."""
 from __future__ import annotations
 
 import re
+import shutil
+import tempfile
 from collections.abc import Hashable
 from pathlib import Path
+from typing import Any, Dict
 
 import yaml
 
@@ -147,3 +150,119 @@ def load_eval_manifest(skill_dir: str | Path) -> dict:
                 )
             )
     return {"version": SUPPORTED_MANIFEST_VERSION, "prompts": normalized}
+
+
+_EVAL_SANDBOXES: dict[str, str] = {}
+
+
+def _sandbox_root_for(skill_dir: Path) -> Path:
+    # The sandbox root is stable per skill path for the life of the process:
+    # repeated evaluations of the same candidate reuse the same skills_dir so
+    # the eval agent sees one consistent skill location across iterate/eval
+    # cycles. The candidate subtree itself is wiped and re-copied per run.
+    key = str(skill_dir.resolve())
+    path = _EVAL_SANDBOXES.get(key)
+    if path is None or not Path(path).is_dir():
+        path = tempfile.mkdtemp(prefix="hermes-skill-eval-")
+        _EVAL_SANDBOXES[key] = path
+    return Path(path)
+
+
+def _build_eval_agent(skills_dir: Path):
+    """Build a confined AIAgent whose skills root is the eval sandbox.
+
+    Confinement contract: strict allowlist via ``enabled_toolsets`` (the
+    safer real-world form — any toolset added later is automatically
+    excluded, so no maintenance against a blocklist). delegation, cronjob,
+    terminal, browser, web, code_execution and all messaging toolsets are
+    thereby unreachable. Missing credentials are tolerated at construction;
+    a credential failure surfaces per-prompt as a failed entry instead of an
+    exception escaping run_evaluation.
+    """
+    from run_agent import AIAgent
+
+    return AIAgent(
+        enabled_toolsets=["skills", "file", "clarify"],
+        skip_context_files=True,
+        skip_memory=True,
+        quiet_mode=True,
+    )
+
+
+def _check_expectation(response: Any, expect: dict) -> bool:
+    """Non-empty response AND every contains substring present (case
+    insensitive) AND (for regex manifests) the pattern matches."""
+    if not isinstance(response, str) or not response.strip():
+        return False
+    contains = expect.get("contains")
+    if contains is not None:
+        lowered = response.lower()
+        return all(str(sub).lower() in lowered for sub in contains)
+    regex = expect.get("regex")
+    if isinstance(regex, str) and regex:
+        try:
+            return re.search(regex, response) is not None
+        except re.error as exc:
+            raise EvalManifestError(f"invalid expect regex: {exc}") from exc
+    return False
+
+
+def run_evaluation(skill_dir: str | Path) -> Dict[str, Any]:
+    """Evaluate a skill candidate against its .evals.yaml manifest.
+
+    Runs a confined agent inside a sandbox containing ONLY the candidate
+    skill (the .candidate overlay is what gets evaluated) and returns
+    {"verdict": "pass"|"fail"|"error", "prompts": [...], "manifest_version": 1}.
+    Prompt failures surface on the prompt record, never as raised exceptions.
+    """
+    skill_dir = Path(skill_dir)
+    try:
+        manifest = load_eval_manifest(skill_dir)
+    except EvalManifestError as exc:
+        return {"verdict": "error", "error": str(exc), "prompts": []}
+
+    sandbox_root = _sandbox_root_for(skill_dir)
+    sandbox_skill = sandbox_root / skill_dir.name
+    if sandbox_skill.exists():
+        shutil.rmtree(sandbox_skill)
+    shutil.copytree(
+        skill_dir,
+        sandbox_skill,
+        ignore=shutil.ignore_patterns(
+            ".candidate", ".curator_backups", "__pycache__"
+        ),
+    )
+    candidate = skill_dir / ".candidate" / "SKILL.md"
+    if candidate.is_file():
+        shutil.copyfile(candidate, sandbox_skill / "SKILL.md")
+
+    agent = _build_eval_agent(sandbox_root)
+    prompt_results = []
+    for entry in manifest["prompts"]:
+        prompt_text = entry["prompt"]
+        expect = entry["expect"]
+        try:
+            response = agent.chat(prompt_text)
+        except Exception as exc:
+            prompt_results.append({
+                "prompt": prompt_text,
+                "passed": False,
+                "response": None,
+                "error": str(exc),
+            })
+            continue
+        prompt_results.append({
+            "prompt": prompt_text,
+            "response": response,
+            "error": None,
+            "passed": _check_expectation(response, expect),
+        })
+    verdict = (
+        "pass" if prompt_results and all(p["passed"] for p in prompt_results)
+        else "fail"
+    )
+    return {
+        "verdict": verdict,
+        "prompts": prompt_results,
+        "manifest_version": manifest.get("version", 1),
+    }
