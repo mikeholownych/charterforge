@@ -430,3 +430,29 @@ Follow-ups (non-blocking):
 2. Boundary-change cache eviction (tightened boundary applies lazily to
    cached auto-route clients).
 3. MoA aggregator-listing guidance for charter authors.
+
+## Status: COMPLETE (2026-09-06)
+
+Commits ac9f1b71cc..f37154253d. Final review verdict READY — 19/19 charter
+suite, 38/38 policy suites, 53/53 objective family, 15/15 db, setup +1P/1✗
+(pre-existing), auxiliary 169✓/29✗ (byte-identical to base). Governance
+contract traced on the riskiest lines: explicit-branch boundary check on the
+wire provider (post-MoA unwrap, pre-client-build), task-chain fail-closed
+condition (skip taxonomy documented incl. backend-skip semantics), and the
+authority_refused end-to-end propagation (raise sites escape all retry
+layers → planner records durably → re-raise). A production masking bug was
+caught and fixed en route: planner_inferences' parse_status validation set
+now accepts "authority_refused" (RED reproduced the exact ValueError mask).
+
+Follow-ups (non-blocking, honestly documented in docstrings + guide):
+1. Three unfenced aux ladders: _try_main_fallback_chain, _try_payment_fallback,
+   _try_discovery_chain (and the vision-branch resolve path).
+2. Auto-primary + cached-client laziness: boundary tightening applies
+   immediately to chains, lazily to cached primaries; eviction-on-change
+   flagged.
+3. MoA aggregator-listing guidance for charter authors (explicit `moa`
+   unwraps to the aggregator wire provider before judgment).
+4. Ladder-path consequence: an authorized primary's payment/timeout failure
+   can be re-branded as authority refusal when the rest of the chain is
+   unauthorized (acceptable in partial-coverage state; revisit with the
+   coverage follow-up).
