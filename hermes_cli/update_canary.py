@@ -74,7 +74,7 @@ def _run_check(name: str, argv: list[str], cwd, deadline: float) -> dict:
     try:
         result = subprocess.run(
             argv, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=timeout)
+            errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as exc:
         detail = f"timed out after {timeout:.0f}s"
         partial = _last_line(

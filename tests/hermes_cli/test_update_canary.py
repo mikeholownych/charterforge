@@ -40,6 +40,26 @@ class TestCanaryChecks:
         failed = [c for c in result["checks"] if not c["ok"]]
         assert any("hermes_cli.config" in c["detail"] for c in failed)
 
+    def test_combined_probe_identifies_each_failing_module(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import update_canary as uc
+
+        root = tmp_path / "proj"
+        (root / "pkg").mkdir(parents=True)
+        (root / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "pkg" / "good.py").write_text("x = 1\n", encoding="utf-8")
+        (root / "pkg" / "bad.py").write_text(
+            "raise ImportError('simulated')\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            uc, "_CORE_IMPORT_PROBES", ["pkg.good", "pkg.bad"]
+        )
+        result = uc.run_canary(project_root=root, python_exe=sys.executable)
+        assert result["verdict"] == "fail"
+        probe = [c for c in result["checks"] if c["name"] == "core_imports"][0]
+        assert "pkg.bad" in probe["detail"]
+
     def test_entry_point_check_reports_failure(self, tmp_path, monkeypatch):
         from hermes_cli import update_canary as uc
 
@@ -81,4 +101,6 @@ class TestCanaryChecks:
         monkeypatch.setattr(uc, "_CHECK_TIMEOUT", 2.0)
         monkeypatch.setattr(uc, "_BUDGET_SECONDS", 3.0)
         result = uc.run_canary(project_root=root, python_exe=sys.executable)
-        assert result["verdict"] in {"fail", "error"}
+        assert result["verdict"] == "fail"
+        entry = [c for c in result["checks"] if c["name"] == "entry_point"]
+        assert "timed out" in entry[0]["detail"]
