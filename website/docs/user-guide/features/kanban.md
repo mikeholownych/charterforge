@@ -650,6 +650,42 @@ To disable without removing: add `dashboard.plugins.kanban.enabled: false` to `c
 
 The GUI is deliberately thin. Everything the plugin does is reachable from the CLI; the plugin just makes it comfortable for humans. Auto-assignment, budgets, governance gates, and org-chart views remain user-space — a router profile, another plugin, or a reuse of `tools/approval.py` — exactly as listed in the out-of-scope section of the design spec.
 
+## Specialist routing and learnings
+
+By default, ready tasks with no assignee fall to `kanban.default_assignee`.
+With specialist routing enabled, the dispatcher asks the auxiliary model to
+pick the best-fit profile from the live roster by task description — so a
+"Add pagination to the REST API" task lands on your API specialist instead
+of a generalist.
+
+```yaml
+kanban:
+  specialist_routing: true
+```
+
+The routing is fail-open: if the model is unreachable, picks a profile that
+doesn't exist, or the roster is empty, the task simply falls through to
+`kanban.default_assignee` exactly as before. Routing never overrides an
+explicit `--assignee`; only tasks that would otherwise get the default are
+routed. Every routing decision is recorded as a comment on the task.
+
+### Specialist learnings
+
+Each specialist accumulates durable operational context. Workers receive
+their specialist's learnings verbatim in the spawn prompt, after the task
+body — so a backend specialist that learned "the API uses cursor
+pagination" applies that knowledge on every future task.
+
+Append to a specialist's learnings:
+
+```bash
+hermes kanban learn backend-dev "The API uses cursor pagination, not offsets."
+```
+
+Learnings live beside the board (`kanban/boards/<board>/.learnings/`), are
+per-assignee, timestamped, and capped (oldest entries evicted past 50) so
+the spawn prompt stays bounded.
+
 ## CLI command reference
 
 This is the surface **you** (or scripts, cron, the dashboard) use to drive the board. Workers running inside the dispatcher use the `kanban_*` [tool surface](#how-workers-interact-with-the-board) for the same operations — the CLI here and the tools there both route through `kanban_db`, so the two surfaces agree by construction.
