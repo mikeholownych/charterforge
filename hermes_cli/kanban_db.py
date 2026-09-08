@@ -170,18 +170,16 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
     a plugin raising, import error) is swallowed — a misbehaving observer must
     never break a board state transition.
 
-    ``profile_name`` is resolved from the active HERMES_HOME so dispatcher- and
-    worker-side hooks both carry the right profile without the caller plumbing
-    it through.
+    Dispatched through ``hermes_cli.lifecycle`` so the first-party
+    observability layer sees lifecycle events too (the body was reverted to
+    plugins-direct by the conflict resolution this branch is recovering
+    from, dropping that side channel); restored verbatim from the pre-split
+    file.
     """
     try:
-        from hermes_cli.plugins import invoke_hook
-        from hermes_cli.profiles import get_active_profile_name
-        try:
-            profile_name = get_active_profile_name()
-        except Exception:
-            profile_name = "default"
-        invoke_hook(event, task_id=task_id, profile_name=profile_name, **fields)
+        from hermes_cli.lifecycle import invoke_hook
+
+        invoke_hook(event, task_id=task_id, profile_name=_hook_profile_name(), **fields)
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
@@ -2823,6 +2821,247 @@ def _claimer_id() -> str:
     except Exception:
         host = "unknown"
     return f"{host}:{os.getpid()}"
+
+
+def _host_prefix() -> str:
+    """``"<host>:"`` prefix shared by every claim lock issued from this host.
+
+    Lost in the kanban-db module split (e03a680592) while the dispatcher
+    kept calling ``_kb._host_prefix()`` — every dispatch tick raised
+    AttributeError in the crash sweep until this restore.
+    """
+    return f"{_claimer_id().split(':', 1)[0]}:"
+
+
+# ---------------------------------------------------------------------------
+# Origin-resident helpers lost in the kanban-db module split (e03a680592).
+#
+# The split commit moved dispatcher/connection/workspace bodies into sibling
+# modules that reach these origin helpers late-bound via ``_kb`` — but the
+# helpers themselves were dropped from this file instead of staying resident,
+# so every extracted-module dispatch tick raised AttributeError. Bodies are
+# restored verbatim from the pre-split file.
+# ---------------------------------------------------------------------------
+
+def _row_get(row: Any, col: str, default: Any = None) -> Any:
+    """``row[col]`` tolerant of the column being absent from the SELECT / schema."""
+    if row is None or col not in row.keys():
+        return default
+    return row[col]
+
+
+def _json_or(value: Any, default: Any = None) -> Any:
+    """Decode a JSON text column; any decode failure or empty value yields ``default``."""
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def _json_dict(value: Any) -> dict:
+    """Decode a JSON text column that must be an object; anything else yields ``{}``."""
+    parsed = _json_or(value, {})
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Integer env override: absent/empty/non-integer/below ``minimum`` falls back to ``default``."""
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return default
+        if parsed >= minimum:
+            return parsed
+    return default
+
+
+def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
+    """Run ``git -C cwd args`` and return stripped stdout, or ``None`` on any failure / empty output."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip() or None
+
+
+def _kanban_observer_consumed(event: str) -> bool:
+    """Return whether any first-party observer or plugin consumes *event*.
+
+    Hot-path short-circuit for the worker-lifecycle / task-mutation /
+    dispatch-tick observers (RFC #58548): those fire on every dispatcher
+    tick and every task write, so call sites skip payload assembly entirely
+    when nothing subscribes. Best-effort — if inspection fails the event is
+    treated as unconsumed (the invoke path would fail the same way, and
+    these are observers, so dropping is always safe).
+    """
+    try:
+        from hermes_cli.lifecycle import has_hook
+
+        return has_hook(event)
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _hook_profile_name() -> str:
+    """Active profile for hook payloads; ``"default"`` when it cannot be resolved."""
+    from hermes_cli.profiles import get_active_profile_name
+
+    try:
+        return get_active_profile_name()
+    except Exception:
+        return "default"
+
+
+def _fire_worker_spawned_hook(
+    conn: sqlite3.Connection,
+    task: "Task",
+    workspace_path: str,
+    pid: Optional[int],
+    *,
+    board: Optional[str] = None,
+) -> None:
+    """Fire ``on_kanban_worker_spawned`` for one dispatched spawn.
+
+    Called by the dispatch loop AFTER ``spawn_fn`` returned and the worker
+    PID (when one was reported) has been durably persisted — the RFC #58548
+    timing contract. Fully best-effort: any failure is swallowed so a
+    misbehaving observer can never break the dispatch loop.
+    """
+    if not _kanban_observer_consumed("on_kanban_worker_spawned"):
+        return
+    try:
+        _fire_kanban_lifecycle_hook(
+            "on_kanban_worker_spawned",
+            task.id,
+            board=board or get_current_board(),
+            assignee=task.assignee,
+            run_id=_current_run_id(conn, task.id),
+            worker_pid=int(pid) if pid else None,
+            workspace_path=str(workspace_path),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("kanban worker spawned hook failed: %s", exc)
+
+
+def _fire_dispatch_tick_hook(
+    result: "DispatchResult",
+    *,
+    board: Optional[str] = None,
+    dry_run: bool = False,
+) -> None:
+    """Fire ``on_kanban_dispatch_tick`` after one dispatcher tick.
+
+    Re-port of PR #56066 per the #64231 batch disposition: renamed to the
+    taxonomy form and called by ``dispatch_once`` strictly AFTER
+    ``_dispatch_tick_lock`` has been released — the original fired inside
+    the lock, so a slow subscriber could extend the single-writer critical
+    section and stall a sibling dispatcher's tick. Observer-only and fully
+    best-effort: any subscriber failure is swallowed.
+    """
+    if not _kanban_observer_consumed("on_kanban_dispatch_tick"):
+        return
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+
+        profile_name = _hook_profile_name()
+        if board is None:
+            try:
+                board = get_current_board()
+            except Exception:
+                board = None
+        outcome = "ok"
+        if result.skipped_locked:
+            outcome = "skipped_locked"
+        elif not any((
+            result.spawned,
+            result.reclaimed,
+            result.promoted,
+            result.reconciled_orphans,
+            result.crashed,
+            result.stale,
+            result.timed_out,
+            result.auto_blocked,
+            result.rate_limited,
+            result.auto_assigned_default,
+            result.respawn_guarded,
+            result.skipped_per_profile_capped,
+            result.skipped_unassigned,
+            result.skipped_nonspawnable,
+        )):
+            outcome = "idle"
+        invoke_hook(
+            "on_kanban_dispatch_tick",
+            board=board,
+            profile_name=profile_name,
+            dry_run=bool(dry_run),
+            outcome=outcome,
+            result=result,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("kanban dispatch tick hook failed: %s", exc)
+
+
+def _insert_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str, created_at: int,
+) -> None:
+    """Raw ``task_comments`` INSERT for callers already inside a write txn.
+
+    ``add_comment`` opens its own ``write_txn`` (raises on nesting) and emits
+    a ``commented`` event; transitions that record their own event use this.
+    """
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, author, body, created_at),
+    )
+
+
+def _opt_int(value: Any) -> Optional[int]:
+    """``int(value)`` or ``None`` when ``value`` is ``None`` (NULL column passthrough)."""
+    return int(value) if value is not None else None
+
+
+def _latest_event(
+    conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
+) -> Optional[sqlite3.Row]:
+    """Newest ``task_events`` row of ``kind`` (optionally scoped to one run)."""
+    sql = "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?"
+    params: tuple[Any, ...] = (task_id, kind)
+    if run_id is not None:
+        sql += " AND run_id = ?"
+        params = (*params, int(run_id))
+    return conn.execute(sql + " ORDER BY id DESC LIMIT 1", params).fetchone()
+
+
+def _retry_status_for_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int] = None,
+) -> str:
+    """Return the non-running phase an interrupted run must resume from.
+
+    Review claims record ``source_status=review`` on their claimed event. All
+    other and legacy runs retry from ``ready``. Keeping this decision in one
+    place prevents crash/timeout/reclaim paths from silently converting a
+    reviewer run into an implementation run.
+    """
+    if run_id is None:
+        run_id = _current_run_id(conn, task_id)
+    if run_id is None:
+        return "ready"
+    event = _latest_event(conn, task_id, "claimed", run_id)
+    payload = _json_dict(_row_get(event, "payload"))
+    return "review" if payload.get("source_status") == "review" else "ready"
 
 
 # ---------------------------------------------------------------------------

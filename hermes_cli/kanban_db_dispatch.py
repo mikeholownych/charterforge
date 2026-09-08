@@ -1598,13 +1598,16 @@ def _dispatch_lane_task(
 
 
 def _apply_default_assignee(
-    conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool,
+    conn: sqlite3.Connection, task_id: str, assignee: str, *,
+    dry_run: bool, source: str = "kanban.default_assignee",
 ) -> bool:
-    """Persist ``kanban.default_assignee`` on an unassigned ready row.
+    """Persist an auto-assignment on an unassigned ready row.
 
-    Mutating the row keeps board state honest: the task is legitimately owned
-    by the default, not "unassigned but secretly routed". ``dry_run`` reports
-    without writing. Returns False when the write failed.
+    Used for ``kanban.default_assignee`` and for specialist-routing picks
+    (``source="kanban.specialist_routing"``). Mutating the row keeps board
+    state honest: the task is legitimately owned by the assignee, not
+    "unassigned but secretly routed". ``dry_run`` reports without writing.
+    Returns False when the write failed.
     """
     if dry_run:
         return True
@@ -1617,7 +1620,7 @@ def _apply_default_assignee(
             )
             _kb._append_event(
                 conn, task_id, "assigned",
-                {"assignee": assignee, "source": "kanban.default_assignee"},
+                {"assignee": assignee, "source": source},
             )
     except Exception:
         _kb._log.debug(
@@ -1818,20 +1821,86 @@ def _dispatch_once_locked(
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
+    # Per-tick routing breaker: routing runs inside the dispatch lock, so
+    # after the first routing call that fails to produce a specialist pick,
+    # routing is skipped for the remainder of the tick — an outage costs at
+    # most one bounded (30s) auxiliary call per tick, never N x 30s.
+    routing_available = True
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
-            # Honour kanban.default_assignee so an unassigned task doesn't
-            # park in 'ready' forever.
-            if not default_assignee or not _apply_default_assignee(
-                conn, row["id"], default_assignee, dry_run=dry_run,
-            ):
-                result.skipped_unassigned.append(row["id"])
-                continue
-            row_assignee = default_assignee
-            result.auto_assigned_default.append(row["id"])
+            # Specialist routing hook (opt-in via kanban.specialist_routing,
+            # fail-open): when an unassigned ready task would otherwise fall
+            # through to kanban.default_assignee, give the auxiliary LLM a
+            # chance to pick a roster specialist first. Explicit operator
+            # assignments are never touched (the hook only runs on empty
+            # assignees), and ANY failure here degrades to the default path
+            # below — routing can never break the dispatch loop.
+            if default_assignee and routing_available:
+                pick: Optional[str] = None
+                attempted = False
+                try:
+                    from hermes_cli import kanban_specialist
+
+                    if kanban_specialist.routing_enabled():
+                        # Disabled → route_task is never called and the
+                        # breaker is not involved at all.
+                        attempted = True
+                        task = _kb.get_task(conn, row["id"])
+                        if task is not None:
+                            desc = (
+                                task.title if not task.body
+                                else f"{task.title}\n\n{task.body}"
+                            )
+                            pick = kanban_specialist.route_task(desc, None)
+                except Exception:
+                    logger.debug(
+                        "kanban dispatch: specialist routing hook error "
+                        "for task %s", row["id"], exc_info=True,
+                    )
+                    pick = None
+                if pick and pick != default_assignee:
+                    if _apply_default_assignee(
+                        conn, row["id"], pick, dry_run=dry_run,
+                        source="kanban.specialist_routing",
+                    ):
+                        row_assignee = pick
+                        # Audit the routing decision on the task. The
+                        # ``assigned`` event (with its source) is the durable
+                        # record; this comment is the human-visible one.
+                        # Best-effort: a comment failure never blocks spawn.
+                        if not dry_run:
+                            try:
+                                _kb.add_comment(
+                                    conn, row["id"], "dispatcher",
+                                    f"specialist route: {pick}",
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "kanban dispatch: specialist routing "
+                                    "audit comment failed for task %s",
+                                    row["id"], exc_info=True,
+                                )
+                elif attempted:
+                    # Routing ran but could not produce a specialist pick —
+                    # None (empty roster / config or LLM failure / invalid
+                    # pick) or the default_assignee fallback itself, which is
+                    # indistinguishable from a genuine "use the default"
+                    # pick. Trip the per-tick breaker and let the default
+                    # path own this task.
+                    routing_available = False
+            if not row_assignee:
+                # Honour kanban.default_assignee so an unassigned task doesn't
+                # park in 'ready' forever.
+                if not default_assignee or not _apply_default_assignee(
+                    conn, row["id"], default_assignee, dry_run=dry_run,
+                ):
+                    result.skipped_unassigned.append(row["id"])
+                    continue
+                row_assignee = default_assignee
+                result.auto_assigned_default.append(row["id"])
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
 

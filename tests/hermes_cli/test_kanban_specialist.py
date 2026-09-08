@@ -261,3 +261,226 @@ class TestLearnings:
         home, _conn = board_env
         prompt = ks.build_worker_prompt("Just the task.", "nobody", home / "kanban")
         assert prompt == "Just the task."
+
+
+class TestRoutingEnabled:
+    """``routing_enabled`` — the shared config seam the dispatcher wiring
+    uses to skip ``route_task`` entirely (lock-held) when routing is off."""
+
+    def test_reads_specialist_routing_flag(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        from hermes_cli import kanban_specialist as ks
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"kanban": {"specialist_routing": True}},
+        )
+        assert ks.routing_enabled() is True
+
+    def test_disabled_config_reads_false(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        from hermes_cli import kanban_specialist as ks
+
+        monkeypatch.setattr(
+            config_mod, "load_config", lambda: {"kanban": {}},
+        )
+        assert ks.routing_enabled() is False
+
+    def test_config_failure_is_fail_closed(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        from hermes_cli import kanban_specialist as ks
+
+        def boom():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr(config_mod, "load_config", boom)
+        assert ks.routing_enabled() is False
+
+
+class TestDispatcherWiring:
+    """Dispatcher tick wiring: unassigned ready tasks that would fall
+    through to ``kanban.default_assignee`` get a specialist routing chance
+    first. Contracts: routed+audited, failure→default, per-tick breaker
+    caps the auxiliary LLM at 1 call, explicit assignments never touched.
+
+    Premise adaptations from the real code:
+    - ``_dispatch_once_locked`` lives in kanban_db_dispatch.py (not
+      kanban_db.py, which keeps a legacy copy); called directly here.
+    - ``create_task`` is keyword-only with ``created_by`` (no ``author``);
+      a fresh parentless task is born ``ready`` so it flows straight into
+      the ready loop.
+    - ``get_task`` returns a ``Task`` dataclass → attribute access.
+    - ``assign_task(conn, task_id, profile)`` has no ``actor`` kwarg.
+    - The spawn seam is the ``_default_spawn`` module global (tests patch
+      it with a recorder; passing ``spawn_fn=`` is the equivalent seam).
+    - The lazy roster (``_load_roster`` → profiles) is empty in a temp
+      HERMES_HOME, so wiring tests patch ``ks._load_roster``.
+    - ``_memory_pressure_level`` is pinned to "ok" so a busy host can't
+      cap the tick at 0/1 spawns and break the two-task breaker test.
+    """
+
+    def _ready_unassigned_task(self, conn):
+        import hermes_cli.kanban_db as kb
+
+        return kb.create_task(
+            conn, title="Add REST pagination", body="API pagination work",
+            created_by="test",
+        )
+
+    def test_unassigned_task_routed_and_audited(
+        self, board_env, all_assignees_spawnable, monkeypatch
+    ):
+        """Unassigned ready task → routed to backend-dev → applied with
+        source=kanban.specialist_routing → audit comment recorded."""
+        import hermes_cli.kanban_db as kb
+        from hermes_cli import kanban_db_dispatch as kd
+        from hermes_cli import kanban_specialist as ks
+
+        home, conn = board_env
+        _enabled(monkeypatch)
+        monkeypatch.setattr(ks, "_load_roster", lambda: ROSTER)
+        task_id = self._ready_unassigned_task(conn)
+        monkeypatch.setattr(
+            ks, "_llm_pick_assignee",
+            lambda task_desc, roster_entries: "backend-dev",
+        )
+        monkeypatch.setattr(kd, "_memory_pressure_level", lambda sample=None: "ok")
+        spawns = []
+        monkeypatch.setattr(
+            kd, "_default_spawn", lambda *a, **k: spawns.append(a) or 0,
+        )
+        # kanban_ops (the daemon) reads kanban.default_assignee from config
+        # and passes it into the tick; mirror that here (_enabled sets it to
+        # "default").
+        kd._dispatch_once_locked(conn, default_assignee="default")
+        refreshed = kb.get_task(conn, task_id)
+        assert refreshed is not None
+        assert refreshed.assignee == "backend-dev"
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='assigned'",
+            (task_id,),
+        ).fetchall()
+        assert any(
+            json.loads(row["payload"]).get("source") == "kanban.specialist_routing"
+            for row in events
+        )
+        comments = conn.execute(
+            "SELECT author, body FROM task_comments WHERE task_id=? AND "
+            "body LIKE 'specialist route%'", (task_id,),
+        ).fetchall()
+        assert len(comments) == 1
+        assert comments[0]["author"] == "dispatcher"
+        assert comments[0]["body"] == "specialist route: backend-dev"
+
+    def test_routing_failure_falls_back_to_default(
+        self, board_env, all_assignees_spawnable, monkeypatch
+    ):
+        from hermes_cli import kanban_db_dispatch as kd
+        from hermes_cli import kanban_specialist as ks
+
+        home, conn = board_env
+        _enabled(monkeypatch)
+        # default_assignee = "default" (in roster) via _enabled's config.
+        monkeypatch.setattr(ks, "_load_roster", lambda: ROSTER)
+        task_id = self._ready_unassigned_task(conn)
+        monkeypatch.setattr(
+            ks, "_llm_pick_assignee",
+            lambda task_desc, roster_entries: "nonexistent",
+        )
+        monkeypatch.setattr(kd, "_memory_pressure_level", lambda sample=None: "ok")
+        spawns = []
+        monkeypatch.setattr(
+            kd, "_default_spawn", lambda *a, **k: spawns.append(a) or 0,
+        )
+        # kanban_ops (the daemon) reads kanban.default_assignee from config
+        # and passes it into the tick; mirror that here (_enabled sets it to
+        # "default").
+        kd._dispatch_once_locked(conn, default_assignee="default")
+        import hermes_cli.kanban_db as kb
+
+        refreshed = kb.get_task(conn, task_id)
+        assert refreshed is not None
+        assert refreshed.assignee == "default"
+        # The fallback came from the DEFAULT path, not a dressed-up
+        # specialist routing: source stays kanban.default_assignee and no
+        # specialist audit comment is written.
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='assigned'",
+            (task_id,),
+        ).fetchall()
+        assert any(
+            json.loads(row["payload"]).get("source") == "kanban.default_assignee"
+            for row in events
+        )
+        assert not conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id=? AND "
+            "body LIKE 'specialist route%'", (task_id,),
+        ).fetchone()
+
+    def test_breaker_caps_llm_calls_per_tick(
+        self, board_env, all_assignees_spawnable, monkeypatch
+    ):
+        """First routing failure trips the per-tick breaker: the second
+        unassigned task in the same tick gets NO LLM call."""
+        import hermes_cli.kanban_db as kb
+        from hermes_cli import kanban_db_dispatch as kd
+        from hermes_cli import kanban_specialist as ks
+
+        home, conn = board_env
+        _enabled(monkeypatch)
+        monkeypatch.setattr(ks, "_load_roster", lambda: ROSTER)
+        t1 = self._ready_unassigned_task(conn)
+        t2 = self._ready_unassigned_task(conn)
+        calls = []
+
+        def counting_pick(task_desc, roster_entries):
+            calls.append(1)
+            return "nonexistent"  # always unknown → always fails validation
+
+        monkeypatch.setattr(ks, "_llm_pick_assignee", counting_pick)
+        monkeypatch.setattr(kd, "_memory_pressure_level", lambda sample=None: "ok")
+        spawns = []
+        monkeypatch.setattr(
+            kd, "_default_spawn", lambda *a, **k: spawns.append(a) or 0,
+        )
+        # kanban_ops (the daemon) reads kanban.default_assignee from config
+        # and passes it into the tick; mirror that here (_enabled sets it to
+        # "default").
+        kd._dispatch_once_locked(conn, default_assignee="default")
+        assert len(calls) == 1  # breaker: 2 tasks, 1 LLM call
+        # Both tasks still reach the default path (fallback semantics intact).
+        r1 = kb.get_task(conn, t1)
+        r2 = kb.get_task(conn, t2)
+        assert r1 is not None and r2 is not None
+        assert r1.assignee == "default" and r2.assignee == "default"
+
+    def test_explicit_assignment_never_overridden(
+        self, board_env, all_assignees_spawnable, monkeypatch
+    ):
+        import hermes_cli.kanban_db as kb
+        from hermes_cli import kanban_db_dispatch as kd
+        from hermes_cli import kanban_specialist as ks
+
+        home, conn = board_env
+        _enabled(monkeypatch)
+        monkeypatch.setattr(ks, "_load_roster", lambda: ROSTER)
+        task_id = self._ready_unassigned_task(conn)
+        kb.assign_task(conn, task_id, "frontend-dev")
+        llm_called = []
+        monkeypatch.setattr(
+            ks, "_llm_pick_assignee",
+            lambda task_desc, roster_entries: llm_called.append(1) or "backend-dev",
+        )
+        monkeypatch.setattr(kd, "_memory_pressure_level", lambda sample=None: "ok")
+        spawns = []
+        monkeypatch.setattr(
+            kd, "_default_spawn", lambda *a, **k: spawns.append(a) or 0,
+        )
+        # kanban_ops (the daemon) reads kanban.default_assignee from config
+        # and passes it into the tick; mirror that here (_enabled sets it to
+        # "default").
+        kd._dispatch_once_locked(conn, default_assignee="default")
+        assert llm_called == []  # routing skipped for explicitly assigned
+        refreshed = kb.get_task(conn, task_id)
+        assert refreshed is not None
+        assert refreshed.assignee == "frontend-dev"

@@ -13,7 +13,10 @@ Governance:
   the dispatcher already uses (#27145).
 
 The roster is matched at dispatch time (creation-time routing lives in
-``kanban_decompose``); wiring into the dispatcher tick lands separately.
+``kanban_decompose``); the dispatcher-tick wiring lives in
+``kanban_db_dispatch._dispatch_once_locked`` — opt-in, fail-open, with a
+per-tick breaker bounding the auxiliary-LLM exposure to one call per tick
+under outage.
 """
 from __future__ import annotations
 
@@ -32,6 +35,23 @@ _PICK_SYSTEM_PROMPT = (
     "no explanation. If no profile fits the task, reply with the "
     "generalist/fallback profile from the roster (e.g. 'default')."
 )
+
+
+def routing_enabled() -> bool:
+    """Whether ``kanban.specialist_routing`` is on.
+
+    Single config-read seam shared by ``route_task`` and the dispatcher
+    wiring, so the wiring can skip the (lock-held) ``route_task`` call
+    entirely when routing is disabled instead of inferring "disabled" from
+    a None return. Fail-closed: any config-read failure reads as disabled.
+    """
+    try:
+        from hermes_cli import config as config_mod
+
+        cfg = config_mod.load_config() or {}
+        return bool((cfg.get("kanban") or {}).get("specialist_routing"))
+    except Exception:
+        return False
 
 
 def _roster_entries(roster: Any) -> list[dict]:
@@ -181,18 +201,21 @@ def route_task(task_desc: str, roster: Any = None) -> Optional[str]:
     valid pick        the picked name
     ================  =============================================
 
-    Task-3 wiring note: routing runs inside the dispatch lock, so a
-    per-tick routing breaker (skip routing for the remainder of the tick
-    after the first LLM failure) is REQUIRED at wiring time to bound
-    N x 30s serial auxiliary calls per tick.
+    Task-3 wiring note: routing runs inside the dispatch lock, so the
+    dispatcher wiring (``kanban_db_dispatch._dispatch_once_locked``) keeps a
+    per-tick routing breaker — after the first call that fails to produce a
+    specialist pick (None, or the default_assignee fallback itself, which is
+    indistinguishable from a genuine "use the default" pick), routing is
+    skipped for the remainder of the tick, bounding the worst case to one
+    serial auxiliary call per tick.
     """
     try:
+        if not routing_enabled():
+            return None
         from hermes_cli import config as config_mod
 
         cfg = config_mod.load_config() or {}
         kanban_cfg = cfg.get("kanban") or {}
-        if not kanban_cfg.get("specialist_routing"):
-            return None
         if roster is None:
             roster = _load_roster()
         entries = _roster_entries(roster)
