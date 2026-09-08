@@ -48,6 +48,38 @@ class AuxiliaryProviderNotAuthorized(RuntimeError):
         )
 
 
+def _boundary_allows(provider: str, boundary: Optional[frozenset]) -> bool:
+    """Charter authority predicate: canonical strip+lower on BOTH sides, so
+    neither the configured provider label nor the charter list needs case
+    normalization at call sites. Consumers must treat a set boundary as
+    authoritative only via ``boundary is not None`` (never truthiness) — an
+    EMPTY frozenset authorizes nothing and must fail closed.
+
+    Covered sites (Task 2): the task ``fallback_chain`` filter in
+    ``_try_configured_fallback_chain`` and the pinned-primary acceptance
+    check in ``_resolve_auto_route``. NOT yet covered (documented follow-up,
+    deliberately out of scope here): ``_try_main_fallback_chain``,
+    ``_try_payment_fallback``, and ``_try_discovery_chain``.
+    """
+    return str(provider or "").strip().lower() in (boundary or frozenset())
+
+
+def _charter_provider_boundary() -> Optional[frozenset]:
+    """Authorized-provider set from the active agentic charter, or None when
+    unrestricted (absent/disabled charter, empty list). Note: a non-empty
+    list of whitespace-only entries yields an EMPTY frozenset — authorize
+    nothing, fail-closed; consumers must test ``is not None``, not truthiness.
+    Fail-open to unrestricted ONLY when the charter cannot be read at all."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.objective_policy import authorized_auxiliary_providers
+
+        charter = (load_config_readonly() or {}).get("agentic") or {}
+        return authorized_auxiliary_providers(charter)
+    except Exception:
+        return None
+
+
 # `openai.OpenAI` is imported lazily (~240 ms cold); `OpenAI` below is a proxy
 # so in-module calls, `auxiliary_client.OpenAI` reads and
 # `patch("agent.auxiliary_client.OpenAI")` all keep working.
@@ -3914,10 +3946,41 @@ def _try_configured_fallback_chain(
     chain = _get_auxiliary_task_config(task).get("fallback_chain")
     if not chain or not isinstance(chain, list):
         return None, None, ""
+    # Charter authority choke-point filter (Task 2): when the agentic charter
+    # declares authorized_providers, drop entries outside the boundary BEFORE
+    # any client is built. The restriction signal is ``boundary is not None``
+    # (never truthiness) — an EMPTY frozenset authorizes nothing, fail-closed.
+    # None (unrestricted) leaves the original loop flow untouched below.
+    boundary = _charter_provider_boundary()
+    unauthorized_attempted: List[str] = []
+    original_indices: List[int] = list(range(len(chain)))
+    if boundary is not None:
+        kept: List[Dict[str, Any]] = []
+        kept_indices: List[int] = []
+        for i, entry in enumerate(chain):
+            if not isinstance(entry, dict):
+                continue
+            fb_provider = str(entry.get("provider", "")).strip()
+            if fb_provider and not _boundary_allows(fb_provider, boundary):
+                unauthorized_attempted.append(fb_provider)
+                logger.debug(
+                    "Auxiliary %s: skipping fallback_chain[%d] provider %r — "
+                    "outside charter authorized_providers %s",
+                    task, i, fb_provider, sorted(boundary),
+                )
+                continue
+            kept.append(entry)
+            kept_indices.append(i)
+        chain = kept
+        original_indices = kept_indices
     skip = _failed_backend_skip(failed_provider, failed_model)
     tried = []
     min_ctx = _task_minimum_context_length(task)
-    for i, entry in enumerate(chain):
+    for chain_pos, entry in enumerate(chain):
+        # Preserve ORIGINAL config indices in labels regardless of filtering
+        # (fallback_chain[1] stays fallback_chain[1] when fallback_chain[0]
+        # is dropped as unauthorized).
+        i = original_indices[chain_pos]
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
@@ -3943,6 +4006,16 @@ def _try_configured_fallback_chain(
                         task, reason, failed_provider, label, resolved_model or fb_model or "default")
             return fb_client, resolved_model or fb_model, label
         tried.append(label)
+    # Fail-closed authority refusal (R3): raise ONLY when at least one
+    # candidate was attempted and skipped as unauthorized AND no authorized
+    # candidate was even tried (``tried`` records authorized entries that
+    # failed to build or screened too-small). If an authorized entry WAS
+    # tried and failed, ``tried`` is non-empty — that is ordinary chain
+    # exhaustion, not an authority refusal.
+    if boundary is not None and unauthorized_attempted and not tried:
+        raise AuxiliaryProviderNotAuthorized(
+            task=task, attempted=unauthorized_attempted, authorized=boundary
+        )
     if tried:
         logger.debug("Auxiliary %s: configured fallback_chain exhausted (tried: %s)", task, ", ".join(tried))
     return None, None, ""
@@ -4165,6 +4238,26 @@ def _resolve_auto_route(
     runtime = _normalize_main_runtime(main_runtime)
     _warn_stale_openai_base_url(runtime.get("provider", ""))
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
+    # Primary acceptance check (Task 2, R5): when the charter sets an
+    # authorized-provider boundary and the primary provider is explicitly
+    # pinned (not "auto"), refuse the unauthorized primary BEFORE the route
+    # attempt — no client is built for a provider the charter does not
+    # authorize. Checked after _main_route_target so the substituted wire
+    # provider (fast-model / MoA aggregator resolution) is what is judged.
+    # Auto primary is out of scope here by design: the fallback chains below
+    # filter their own candidates against the same boundary.
+    boundary = _charter_provider_boundary()
+    pinned = str(main_provider or "").strip()
+    if (
+        boundary is not None
+        and pinned and pinned.lower() != "auto"
+        and not _boundary_allows(pinned, boundary)
+    ):
+        raise AuxiliaryProviderNotAuthorized(
+            task=task or "<auto>",
+            attempted=[pinned],
+            authorized=boundary,
+        )
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
