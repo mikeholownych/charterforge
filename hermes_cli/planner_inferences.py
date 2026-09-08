@@ -65,7 +65,10 @@ def record(
 ) -> str:
     """Persist one completed or failed inference without later mutation."""
     ensure_schema(conn)
-    if parse_status not in {"parsed", "invalid_response", "call_failed"}:
+    # charter authority boundary refused the call (fail-closed evidence)
+    if parse_status not in {
+        "parsed", "invalid_response", "call_failed", "authority_refused",
+    }:
         raise ValueError("invalid planner inference parse status")
     objective = conn.execute(
         "SELECT organization_id FROM objectives WHERE id=?", (objective_id,)

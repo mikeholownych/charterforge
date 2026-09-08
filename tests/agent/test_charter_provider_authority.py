@@ -398,3 +398,49 @@ class TestPlannerAuthorityEvidence:
             "objective_planner" in str(recorded[0]["error"])
             or "auxiliary" in str(recorded[0]["error"])
         )
+
+    def test_planner_inferences_accepts_authority_refused(self, tmp_path):
+        """The REAL planner_inferences.record accepts
+        parse_status='authority_refused' — no ValueError masking the typed
+        re-raise in production.
+
+        Premise: record(conn, *, ...) takes the connection positionally and
+        all other parameters keyword-only; it requires the objective row to
+        exist (FK is on) and calls ensure_schema itself."""
+        from hermes_cli import objectives_db as db
+        from hermes_cli import planner_inferences
+
+        with db.connect_closing(str(tmp_path / "pinf.db")) as conn:
+            objective = db.create_objective(
+                conn,
+                desired_outcome="exercise the authority evidence path",
+                originator="test",
+                organization_id="__unscoped__",
+            )
+            planner_inferences.record(
+                conn,
+                objective_id=objective.id,
+                inbox_event_id=None,
+                planner_identity="employee:ceo",
+                task="objective_planner",
+                model=None,
+                request={"messages": []},
+                response_text=None,
+                parse_status="authority_refused",
+                error=(
+                    "auxiliary task 'objective_planner': attempted providers "
+                    "['openrouter'] are outside the charter's authorized "
+                    "providers ['nous'] — call refused (fail-closed authority "
+                    "boundary)"
+                ),
+                input_tokens=0,
+                output_tokens=0,
+                started_at=0,
+                finished_at=1,
+            )
+            row = conn.execute(
+                "SELECT parse_status FROM planner_inferences "
+                "ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            assert row is not None
+            assert row["parse_status"] == "authority_refused"
