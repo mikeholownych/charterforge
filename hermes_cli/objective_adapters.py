@@ -218,7 +218,10 @@ class AuxiliaryObjectivePlanner:
     def propose(
         self, snapshot: Mapping[str, Any], event: Mapping[str, Any]
     ) -> PlanProposal:
-        from agent.auxiliary_client import call_llm
+        from agent.auxiliary_client import (
+            AuxiliaryProviderNotAuthorized,
+            call_llm,
+        )
 
         bounded_snapshot = {
             "id": snapshot.get("id"),
@@ -330,6 +333,30 @@ class AuxiliaryObjectivePlanner:
             max_tokens=4096,
             timeout=self.timeout,
             )
+        except AuxiliaryProviderNotAuthorized as exc:
+            release_failed_reservation("authority_refused")
+            if self.authority_conn is not None:
+                from hermes_cli import planner_inferences
+
+                planner_inferences.record(
+                    self.authority_conn,
+                    objective_id=str(snapshot.get("id") or ""),
+                    inbox_event_id=(
+                        str(event["id"]) if event.get("id") is not None else None
+                    ),
+                    planner_identity=self.identity,
+                    task="objective_planner",
+                    model=None,
+                    request=request_record,
+                    response_text=None,
+                    parse_status="authority_refused",
+                    error=str(exc),
+                    input_tokens=0,
+                    output_tokens=0,
+                    started_at=started_at,
+                    finished_at=time.time_ns(),
+                )
+            raise
         except Exception as exc:
             release_failed_reservation("llm_call_failed")
             if self.authority_conn is not None:

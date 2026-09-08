@@ -335,3 +335,66 @@ class TestPrimaryBoundary:
             )
         assert excinfo.value.attempted == ["openrouter"]
         assert excinfo.value.authorized == {"nous"}
+
+
+# ── Planner authority evidence (Task 3) ────────────────────────────────────
+
+
+class TestPlannerAuthorityEvidence:
+    def test_planner_records_authority_refusal(self, monkeypatch):
+        """When the boundary refuses the planner call, the durable
+        planner_inferences record shows parse_status='authority_refused' with
+        the error — post-hoc review can see WHY planning did not happen.
+
+        Premise adaptations: RegisteredActionContract lives in
+        hermes_cli.objective_adapters (payload_required/payload_optional
+        tuples, no payload_schema). The record path only runs when
+        authority_conn is truthy, so the planner is built with a dummy truthy
+        conn. With resource_limits=None no compute reservation exists
+        (accounts_resources_pre_call is False), so the release path is inert
+        by construction and release is not asserted here."""
+        from hermes_cli import objective_adapters, planner_inferences
+        from agent import auxiliary_client as aux
+
+        recorded = []
+        monkeypatch.setattr(
+            planner_inferences, "record", lambda *a, **k: recorded.append(k)
+        )
+
+        def refuse(**kwargs):
+            raise aux.AuxiliaryProviderNotAuthorized(
+                task="objective_planner",
+                attempted=["openrouter"],
+                authorized=frozenset({"nous"}),
+            )
+
+        monkeypatch.setattr(aux, "call_llm", refuse)
+
+        contract = objective_adapters.RegisteredActionContract(
+            action_type="noop",
+            required_capability="noop.cap",
+            target_system="none",
+            verification_method="manual",
+        )
+        planner = objective_adapters.AuxiliaryObjectivePlanner(
+            action_contracts=[contract],
+            authority_conn=object(),  # truthy: enables the record path
+        )
+        snapshot = {
+            "id": "obj-1", "desired_outcome": "x", "status": "planned",
+            "constraints": [], "success_criteria": [], "termination": [],
+            "permitted_systems": [], "prohibited_actions": [],
+            "max_spend_minor": 0, "plans": [], "actions": [],
+            "verifications": [],
+        }
+        event = {"event_type": "ceo.operating_review", "payload": {},
+                 "attempts": 0, "id": "evt-1"}
+        with pytest.raises(aux.AuxiliaryProviderNotAuthorized):
+            planner.propose(snapshot, event)
+
+        assert recorded and recorded[0]["parse_status"] == "authority_refused"
+        assert recorded[0]["task"] == "objective_planner"
+        assert (
+            "objective_planner" in str(recorded[0]["error"])
+            or "auxiliary" in str(recorded[0]["error"])
+        )
