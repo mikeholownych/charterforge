@@ -42,8 +42,8 @@ import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_constants import get_hermes_home, display_hermes_home
-from utils import atomic_replace, is_truthy_value
+from hermes_constants import get_hermes_home, display_hermes_home, get_skills_dir
+from utils import atomic_replace, atomic_write_text, is_truthy_value
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
     extract_skill_description,
@@ -454,6 +454,12 @@ def _background_review_read_before_write_guard(
 
 
 def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
+    # evolve has its own governance gates (autonomous_evolution config,
+    # user-skill path check, agent provenance); the background-review
+    # preflight does not apply to it — a staged candidate never touches the
+    # live skill, so there is no live write for a review fork to guard.
+    if action == "evolve":
+        return None
     if action not in {"edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     existing = _find_skill(name)
@@ -1322,6 +1328,140 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
 
 
 # =============================================================================
+# Autonomous skill evolution (skill_manage action="evolve")
+# =============================================================================
+
+def _evolution_enabled() -> bool:
+    """G1: whether autonomous skill evolution is enabled (default OFF).
+
+    Reads ``skills.autonomous_evolution`` from config. The key is not yet in
+    DEFAULT_CONFIG (it ships with the evolution rollout), so an absent key
+    means "off" — the gate fails closed. Errors reading config also fail
+    closed, matching the error-tolerant pattern of ``_guard_agent_created_enabled``.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        return False
+    return is_truthy_value(
+        cfg.get("skills", {}).get("autonomous_evolution", False)
+    )
+
+
+def _evolution_skill_dir(name: str) -> Optional[Path]:
+    """G2: resolve *name* to a top-level USER skill directory, fail-closed.
+
+    Only skills living DIRECTLY under ``get_skills_dir()`` are eligible for
+    autonomous evolution. Refuse (return None) when: the name is empty,
+    contains path separators (covers ``_hub/...``, ``..`` traversal and
+    absolute paths), any relative path component starts with "." or "_"
+    (bundled/hub/backup/hidden namespaces), the candidate path is a symlink
+    or junction redirect, or no SKILL.md exists at the resolved path (the
+    skill itself is not a top-level user skill, e.g. a hub bundle name).
+    """
+    if not name or not isinstance(name, str):
+        return None
+    if "/" in name or "\\" in name or name in {".", ".."}:
+        return None
+    skills_root = get_skills_dir()
+    candidate = skills_root / name
+    try:
+        relative = candidate.relative_to(skills_root)
+    except ValueError:
+        return None
+    for part in relative.parts:
+        if part.startswith(".") or part.startswith("_"):
+            return None
+    if _is_path_redirect(candidate):
+        return None
+    if not (candidate / "SKILL.md").is_file():
+        return None
+    return candidate
+
+
+def _skill_created_by(name: str) -> str:
+    """G3: the skill's provenance marker from ~/.hermes/skills/.usage.json.
+
+    Reuses ``tools.skill_usage.load_usage()`` — the same error-tolerant reader
+    the background-curator ownership guard uses. A missing record, a missing
+    marker, or an unreadable file returns "" (the evolve gate treats that as
+    "not agent-authored" and refuses — fail closed).
+    """
+    try:
+        from tools.skill_usage import load_usage
+        record = load_usage().get(name)
+    except Exception:
+        return ""
+    if not isinstance(record, dict):
+        return ""
+    return record.get("created_by") or ""
+
+
+def _evolve_skill(name: str, content: str) -> Dict[str, Any]:
+    """Stage an evolved candidate at ``<skill_dir>/.candidate/SKILL.md``.
+
+    Governance gates, in order:
+      G1 ``skills.autonomous_evolution`` must be enabled (default off).
+      G2 the skill must be a top-level user skill under ``get_skills_dir()``
+         (never bundled/hub/backup/hidden namespaces).
+      G3 the ``.usage.json`` provenance marker must be ``created_by: "agent"``.
+
+    The candidate is written atomically (temp file + os.replace via
+    ``atomic_write_text``), overwriting any prior candidate. The live
+    SKILL.md is never touched; promotion is a separate, evaluated step.
+    """
+    # G1 — feature gate (naming the config key so users can find the toggle).
+    if not _evolution_enabled():
+        return {
+            "success": False,
+            "error": (
+                "Refusing to evolve skill: autonomous skill evolution is "
+                "disabled. Set skills.autonomous_evolution: true in "
+                "config.yaml to enable it."
+            ),
+        }
+
+    # G2 — top-level user skill only.
+    skill_dir = _evolution_skill_dir(name)
+    if skill_dir is None:
+        return {
+            "success": False,
+            "error": (
+                f"Refusing to evolve '{name}': only user skills living "
+                f"directly under {get_skills_dir()} are eligible for "
+                "autonomous evolution. Bundled, hub-installed, backed-up, "
+                "or hidden-namespace skills are off-limits."
+            ),
+        }
+
+    # G3 — agent provenance.
+    created_by = _skill_created_by(name)
+    if created_by != "agent":
+        return {
+            "success": False,
+            "error": (
+                f"Refusing to evolve '{name}': the skill is not "
+                f"agent-authored (created_by={created_by!r}). Only skills "
+                "with created_by == 'agent' may be autonomously evolved. "
+                f"Run `hermes curator adopt {name}` to opt it in."
+            ),
+        }
+
+    candidate_dir = skill_dir / ".candidate"
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    candidate_file = candidate_dir / "SKILL.md"
+    # Overwrite any prior candidate atomically — temp file + os.replace.
+    atomic_write_text(candidate_file, content, tmp_prefix=".evolve_")
+
+    return {
+        "success": True,
+        "staged": True,
+        "candidate": str(candidate_file),
+    }
+
+
+# =============================================================================
 # Main entry point
 # =============================================================================
 
@@ -1336,8 +1476,15 @@ _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
 def _apply_skill_write_gate(action, name, **payload_kwargs):
     """Evaluate the skill write gate. Returns a JSON tool-result string when the
     write should NOT proceed (blocked or staged), or None to perform the real
-    write. Bypassed during approved-pending replay.
+    write.     Bypassed during approved-pending replay.
     """
+    # evolve has its own governance gates (autonomous_evolution config,
+    # user-skill path check, agent provenance); the human-approval write
+    # gate does not apply to staged candidates that never touch the live
+    # skill. Return before the gate's staging logic so an evolve call is
+    # never queued for approval.
+    if action == "evolve":
+        return None
     if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     if _skill_gate_bypass.get():
@@ -1459,6 +1606,11 @@ def skill_manage(
         if not file_path:
             return tool_error("file_path is required for 'remove_file'.", success=False)
         result = _remove_file(name, file_path)
+
+    elif action == "evolve":
+        if not content:
+            return tool_error("content is required for 'evolve'. Provide the full candidate SKILL.md text.", success=False)
+        result = _evolve_skill(name, content)
 
     else:
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}

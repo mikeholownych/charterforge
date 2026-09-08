@@ -148,3 +148,99 @@ class TestManifestLoader:
 
         (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
         assert load_eval_manifest(agent_skill)["version"] == 1
+
+
+class TestCandidateStaging:
+    # Premise correction vs the plan sketch: the fixture does NOT monkeypatch
+    # config, so every test here pins config_mod.load_config explicitly. With
+    # no patch, load_config() reads real config where autonomous_evolution is
+    # absent (=> off) and even the happy path would fail G1. Determinism first.
+
+    def test_evolve_stages_candidate_without_touching_live(self, agent_skill, monkeypatch):
+        import hermes_cli.config as config_mod
+        from tools.skill_manager_tool import skill_manage
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": True}},
+        )
+        improved = ("---\nname: my-skill\ndescription: Test skill.\n"
+                    "version: 1.1\nauthor: \"Test <test@example.com>\"\n"
+                    "created_by: agent\n---\n\n# My Skill\n\nIMPROVED.\n")
+        result = json.loads(skill_manage(
+            "evolve", "my-skill", content=improved,
+        ))
+        assert result["success"] is True
+        candidate = agent_skill / ".candidate" / "SKILL.md"
+        assert candidate.is_file()
+        assert "IMPROVED." in candidate.read_text(encoding="utf-8")
+        live = (agent_skill / "SKILL.md").read_text(encoding="utf-8")
+        assert "IMPROVED." not in live
+
+    def test_evolve_requires_evolution_enabled(self, agent_skill, monkeypatch):
+        import hermes_cli.config as config_mod
+        from tools.skill_manager_tool import skill_manage
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": False}},
+        )
+        result = json.loads(skill_manage(
+            "evolve", "my-skill", content="# improved\n",
+        ))
+        assert result["success"] is False
+        assert "autonomous_evolution" in json.dumps(result)
+
+    def test_evolve_refuses_non_agent_skill(self, agent_skill, monkeypatch):
+        import hermes_cli.config as config_mod
+        from tools.skill_manager_tool import skill_manage
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": True}},
+        )
+        usage_file = agent_skill.parent / ".usage.json"
+        usage_file.write_text(json.dumps({
+            "my-skill": {"created_by": "human", "use_count": 0,
+                         "view_count": 0, "patch_count": 0},
+        }), encoding="utf-8")
+        result = json.loads(skill_manage(
+            "evolve", "my-skill", content="# improved\n",
+        ))
+        assert result["success"] is False
+        assert "created_by" in json.dumps(result)
+
+    def test_evolve_refuses_hub_skill(self, agent_skill, monkeypatch):
+        import hermes_cli.config as config_mod
+        from tools.skill_manager_tool import skill_manage
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": True}},
+        )
+        hub = agent_skill.parent / "_hub" / "some-bundle"
+        hub.mkdir(parents=True)
+        (hub / "SKILL.md").write_text("# bundled\n", encoding="utf-8")
+        usage_file = agent_skill.parent / ".usage.json"
+        usage_file.write_text(json.dumps({
+            "some-bundle": {"created_by": "agent", "use_count": 0,
+                            "view_count": 0, "patch_count": 0},
+        }), encoding="utf-8")
+        result = json.loads(skill_manage(
+            "evolve", "some-bundle", content="# improved\n",
+        ))
+        assert result["success"] is False
+
+    def test_evolve_replaces_previous_candidate(self, agent_skill, monkeypatch):
+        import hermes_cli.config as config_mod
+        from tools.skill_manager_tool import skill_manage
+
+        monkeypatch.setattr(
+            config_mod, "load_config",
+            lambda: {"skills": {"autonomous_evolution": True}},
+        )
+        skill_manage("evolve", "my-skill", content="# v1 candidate\n")
+        skill_manage("evolve", "my-skill", content="# v2 candidate\n")
+        candidate = agent_skill / ".candidate" / "SKILL.md"
+        text = candidate.read_text(encoding="utf-8")
+        assert "v2" in text and "v1" not in text
