@@ -774,8 +774,10 @@ def _run_post_update_canary(pre_pull_sha: str, git_cmd) -> None:
         print(f"→ Rolling back to {pre_pull_sha[:10]}...")
         rollback_result = _git_run(git_cmd, ["reset", "--hard", pre_pull_sha])
         if rollback_result.returncode == 0:
-            print("  ✓ Rollback complete — your install is unchanged.")
-            print("  Try ``hermes update`` again later once a fix lands.")
+            print("  ✓ Code rolled back to the pre-pull version.")
+            print("  Note: dependencies were already synced to the pulled tree;")
+            print("  if the update changed them, re-running ``hermes update``")
+            print("  (or a reinstall) once a fix lands realigns the venv.")
         else:
             print("  ✗ Rollback failed. Recover manually with:")
             print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
