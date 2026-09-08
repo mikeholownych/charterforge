@@ -311,8 +311,9 @@ class TestEvaluationRunner:
         (agent_skill / ".candidate" / "SKILL.md").write_text(
             "# CANDIDATE MARKER\n", encoding="utf-8"
         )
+        captured.clear()  # second capture replaces the first
         se.run_evaluation(agent_skill)
-        assert "CANDIDATE MARKER" in (sandbox / "my-skill" / "SKILL.md").read_text(encoding="utf-8")
+        assert "CANDIDATE MARKER" in (captured["skills_dir"] / "my-skill" / "SKILL.md").read_text(encoding="utf-8")
 
     def test_sandbox_excludes_candidate_dir_copy(self, agent_skill, monkeypatch):
         """The .candidate/ dir is copied over SKILL.md, NOT copied as a
@@ -343,3 +344,34 @@ class TestEvaluationRunner:
         assert result["verdict"] == "error"
         assert "no .evals.yaml" in result.get("error", "")
         assert result["prompts"] == []
+
+    def test_concurrent_evaluations_get_distinct_sandboxes(
+        self, agent_skill, monkeypatch
+    ):
+        """Two evaluations of the same skill run in distinct sandboxes — no
+        shared-state bleed, no process-lifetime cache."""
+        from agent import skill_evolution as se
+
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+        paths = []
+        class _SpyAgent:
+            def __init__(self, *a, **k): pass
+            def chat(self, message, **k): return "steps, verify, retry"
+        def spy_build(skills_dir: Path):
+            paths.append(Path(skills_dir))
+            return _SpyAgent()
+        monkeypatch.setattr(se, "_build_eval_agent", spy_build)
+        se.run_evaluation(agent_skill)
+        se.run_evaluation(agent_skill)
+        assert len(paths) == 2 and paths[0] != paths[1]
+
+    def test_agent_build_failure_is_verdict_error(self, agent_skill, monkeypatch):
+        from agent import skill_evolution as se
+
+        (agent_skill / ".evals.yaml").write_text(MANIFEST, encoding="utf-8")
+        def boom(skills_dir):
+            raise RuntimeError("no credentials configured")
+        monkeypatch.setattr(se, "_build_eval_agent", boom)
+        result = se.run_evaluation(agent_skill)
+        assert result["verdict"] == "error"
+        assert "no credentials" in result["error"]

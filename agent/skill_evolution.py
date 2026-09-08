@@ -152,22 +152,6 @@ def load_eval_manifest(skill_dir: str | Path) -> dict:
     return {"version": SUPPORTED_MANIFEST_VERSION, "prompts": normalized}
 
 
-_EVAL_SANDBOXES: dict[str, str] = {}
-
-
-def _sandbox_root_for(skill_dir: Path) -> Path:
-    # The sandbox root is stable per skill path for the life of the process:
-    # repeated evaluations of the same candidate reuse the same skills_dir so
-    # the eval agent sees one consistent skill location across iterate/eval
-    # cycles. The candidate subtree itself is wiped and re-copied per run.
-    key = str(skill_dir.resolve())
-    path = _EVAL_SANDBOXES.get(key)
-    if path is None or not Path(path).is_dir():
-        path = tempfile.mkdtemp(prefix="hermes-skill-eval-")
-        _EVAL_SANDBOXES[key] = path
-    return Path(path)
-
-
 def _build_eval_agent(skills_dir: Path):
     """Build a confined AIAgent whose skills root is the eval sandbox.
 
@@ -176,8 +160,9 @@ def _build_eval_agent(skills_dir: Path):
     excluded, so no maintenance against a blocklist). delegation, cronjob,
     terminal, browser, web, code_execution and all messaging toolsets are
     thereby unreachable. Missing credentials are tolerated at construction;
-    a credential failure surfaces per-prompt as a failed entry instead of an
-    exception escaping run_evaluation.
+    a credential failure surfaces per-prompt as a failed entry; any
+    construction exception is converted to an error verdict by
+    run_evaluation.
     """
     from run_agent import AIAgent
 
@@ -214,6 +199,9 @@ def run_evaluation(skill_dir: str | Path) -> Dict[str, Any]:
     skill (the .candidate overlay is what gets evaluated) and returns
     {"verdict": "pass"|"fail"|"error", "prompts": [...], "manifest_version": 1}.
     Prompt failures surface on the prompt record, never as raised exceptions.
+    The sandbox is a fresh temporary directory created per call — no
+    per-skill cache or shared state — so concurrent evaluations of the same
+    skill never collide, and no evaluation reuses another's directory.
     """
     skill_dir = Path(skill_dir)
     try:
@@ -221,10 +209,8 @@ def run_evaluation(skill_dir: str | Path) -> Dict[str, Any]:
     except EvalManifestError as exc:
         return {"verdict": "error", "error": str(exc), "prompts": []}
 
-    sandbox_root = _sandbox_root_for(skill_dir)
+    sandbox_root = Path(tempfile.mkdtemp(prefix="hermes-skill-eval-"))
     sandbox_skill = sandbox_root / skill_dir.name
-    if sandbox_skill.exists():
-        shutil.rmtree(sandbox_skill)
     shutil.copytree(
         skill_dir,
         sandbox_skill,
@@ -236,7 +222,11 @@ def run_evaluation(skill_dir: str | Path) -> Dict[str, Any]:
     if candidate.is_file():
         shutil.copyfile(candidate, sandbox_skill / "SKILL.md")
 
-    agent = _build_eval_agent(sandbox_root)
+    try:
+        agent = _build_eval_agent(sandbox_root)
+    except Exception as exc:
+        return {"verdict": "error", "error": str(exc), "prompts": []}
+
     prompt_results = []
     for entry in manifest["prompts"]:
         prompt_text = entry["prompt"]
