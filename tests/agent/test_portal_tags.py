@@ -326,3 +326,119 @@ def test_compress_context_preserves_ambient_context(monkeypatch):
         assert get_conversation_context() == "outer-root"
     finally:
         reset_conversation_context(token)
+
+
+# ── Affinity/routing scope ──────────────────────────────────────────────────
+
+
+def test_affinity_scope_set_get_reset_roundtrip():
+    """set_affinity_scope returns a token; reset restores the prior scope."""
+    from agent.portal_tags import (
+        get_affinity_scope,
+        reset_affinity_scope,
+        set_affinity_scope,
+    )
+
+    assert get_affinity_scope() is None
+    token = set_affinity_scope("opencode-sess-1")
+    try:
+        assert get_affinity_scope() == "opencode-sess-1"
+    finally:
+        reset_affinity_scope(token)
+    assert get_affinity_scope() is None
+
+
+def test_affinity_scope_set_none_clears():
+    """set_affinity_scope(None/'') stores None (no sticky key)."""
+    from agent.portal_tags import (
+        get_affinity_scope,
+        reset_affinity_scope,
+        set_affinity_scope,
+    )
+
+    for empty in (None, ""):
+        token = set_affinity_scope(empty)
+        try:
+            assert get_affinity_scope() is None
+        finally:
+            reset_affinity_scope(token)
+
+
+def test_affinity_scope_isolated_between_contexts():
+    """Two copied Contexts (≈ concurrent agents) don't leak routing scopes."""
+    import contextvars
+
+    from agent.portal_tags import get_affinity_scope, set_affinity_scope
+
+    def _in_scope(key):
+        set_affinity_scope(key)
+        return get_affinity_scope()
+
+    assert contextvars.copy_context().run(_in_scope, "agent-a") == "agent-a"
+    assert contextvars.copy_context().run(_in_scope, "agent-b") == "agent-b"
+    # The outer (test) context stays clean.
+    assert get_affinity_scope() is None
+
+
+def test_affinity_scope_reset_with_foreign_token_clears_instead_of_raising():
+    """A token from another Context must not raise in cleanup paths."""
+    import contextvars
+
+    from agent.portal_tags import (
+        get_affinity_scope,
+        reset_affinity_scope,
+        set_affinity_scope,
+    )
+
+    foreign_token = contextvars.copy_context().run(set_affinity_scope, "other")
+    reset_affinity_scope(foreign_token)  # must not raise
+    assert get_affinity_scope() is None
+
+
+def test_affinity_scope_independent_of_conversation_context():
+    """Setting one scope never disturbs the other."""
+    from agent.portal_tags import (
+        get_affinity_scope,
+        get_conversation_context,
+        reset_affinity_scope,
+        reset_conversation_context,
+        set_affinity_scope,
+        set_conversation_context,
+    )
+
+    conv_token = set_conversation_context("conv-1")
+    aff_token = set_affinity_scope("scope-1")
+    try:
+        assert get_conversation_context() == "conv-1"
+        assert get_affinity_scope() == "scope-1"
+        reset_affinity_scope(aff_token)
+        assert get_affinity_scope() is None
+        assert get_conversation_context() == "conv-1"
+    finally:
+        reset_conversation_context(conv_token)
+
+
+def test_core_consumers_import_affinity_scope_api():
+    """The import contract every consumer relies on: the trio exists.
+
+    Regression guard for the fork breakage where openrouter (hard import),
+    turn_facade, run_agent, and compression_facade all imported
+    ``get_affinity_scope`` from a portal_tags that lacked it.
+    """
+    import importlib
+
+    from agent import portal_tags
+
+    for name in ("get_affinity_scope", "set_affinity_scope", "reset_affinity_scope"):
+        assert hasattr(portal_tags, name), name
+    importlib.import_module("agent.compression_facade")
+    importlib.import_module("agent.turn_facade")
+    # The openrouter plugin hard-imports the trio at module load; discovery
+    # failing to register it is exactly the original breakage symptom.
+    import os
+
+    import providers
+
+    providers._discover_providers()
+    names = [p.name for p in providers.list_providers()]
+    assert "openrouter" in names, names

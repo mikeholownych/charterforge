@@ -94,6 +94,16 @@ def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
     return ordered
 
 
+def _finalize_codex_models(model_ids: List[str]) -> List[str]:
+    """Finalize a curated Codex list: dedupe (input order) + forward-compat synthesis.
+
+    The single entry point ``hermes_cli.models._codex_curated_models`` calls so
+    the gateway /model picker and the CLI ``hermes model`` flow derive their
+    catalog identically from ``DEFAULT_CODEX_MODELS``.
+    """
+    return _add_forward_compat_models(model_ids)
+
+
 def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
     """Best-effort extraction of ``chatgpt_account_id`` from the OAuth JWT.
 

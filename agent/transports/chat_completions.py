@@ -128,6 +128,41 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     return "gemini" in m or "gemma" in m
 
 
+def _add_prompt_cache_key(
+    kwargs: Dict[str, Any],
+    *,
+    messages=None,
+    tools=None,
+    supports_prompt_cache_key: bool = False,
+    session_id: Any = None,
+    cache_scope_id: Any = None,
+) -> None:
+    """Set ``prompt_cache_key`` (in place) from the static prefix + routing scope.
+
+    Mirrors the Responses transport's derivation (#78941 / #79017): the key
+    content-addresses the static request prefix (system message + sorted tool
+    schemas), salted by the normalized routing scope — the logical
+    conversation scope (``cache_scope_id``) when the caller declared one,
+    else the physical ``session_id``. Rotation within one conversation keeps
+    one warm bucket; distinct conversations (and cron fires of one job, via
+    the scope normalization) keep sharing where they must. Providers without
+    ``prompt_cache_key`` support are left untouched.
+    """
+    if not supports_prompt_cache_key:
+        return
+    from agent.transports.codex import _cache_scope_from_session_id, _content_cache_key
+
+    instructions = ""
+    for message in messages or []:
+        if isinstance(message, dict) and message.get("role") == "system":
+            instructions = str(message.get("content") or "").strip()
+            break
+    scope = _cache_scope_from_session_id(cache_scope_id or session_id)
+    cache_key = _content_cache_key(instructions, tools, scope) or scope
+    if cache_key:
+        kwargs["prompt_cache_key"] = cache_key
+
+
 class ChatCompletionsTransport(ProviderTransport):
     """Transport for api_mode='chat_completions'.
 

@@ -82,6 +82,48 @@ def get_conversation_context() -> Optional[str]:
     return _conversation_id.get()
 
 
+# ── Ambient routing/affinity scope ───────────────────────────────────────────
+#
+# The conversation id above tags Portal requests for attribution. The affinity
+# scope is its routing-side sibling (#96811): the stable sticky-routing key a
+# HOST declares when it names its own conversation (OpenCode sessions, hosts
+# with per-response cache scoping). Resolvers prefer it over the conversation
+# id — ``get_affinity_scope() or get_conversation_context() or session_id`` —
+# because a host-declared scope is the key the endpoint actually caches under.
+#
+# Same ContextVar shape (and same isolation rationale) as the conversation
+# context: concurrent agents in one process never see each other's scope.
+_affinity_scope: ContextVar[Optional[str]] = ContextVar(
+    "nous_portal_affinity_scope", default=None
+)
+
+
+def set_affinity_scope(scope: Optional[str]):
+    """Publish the ambient routing scope for sticky-key resolution.
+
+    Set by the turn/compression entrypoints when the host declared a
+    conversation scope (``agent.prompt_cache_scope.declared_conversation_scope_safe``).
+    Pass ``None`` to clear. Returns the ContextVar token so callers can
+    ``reset_affinity_scope(token)`` on exit.
+    """
+    return _affinity_scope.set(scope or None)
+
+
+def reset_affinity_scope(token) -> None:
+    """Restore the previous routing scope (pair with ``set_affinity_scope``)."""
+    try:
+        _affinity_scope.reset(token)
+    except Exception:
+        # Token from another Context (e.g. reset on a different thread) —
+        # fall back to clearing rather than raising in cleanup paths.
+        _affinity_scope.set(None)
+
+
+def get_affinity_scope() -> Optional[str]:
+    """Return the ambient routing scope, or ``None`` when unset."""
+    return _affinity_scope.get()
+
+
 def _hermes_version() -> str:
     """Return the current Hermes release version, e.g. ``"0.13.0"``.
 

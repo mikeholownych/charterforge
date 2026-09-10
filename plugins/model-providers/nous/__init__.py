@@ -2,7 +2,11 @@
 
 from typing import Any
 
-from agent.portal_tags import get_conversation_context, nous_portal_tags
+from agent.portal_tags import (
+    get_affinity_scope,
+    get_conversation_context,
+    nous_portal_tags,
+)
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -39,8 +43,10 @@ class NousProfile(ProviderProfile):
         # ``compression.in_place: true`` (#38763), where compaction keeps the
         # session id; the ambient root additionally keeps the key stable for
         # installs that opt back into rotating compaction, and across
-        # delegate-subagent trees.
-        sticky_key = get_conversation_context() or session_id
+        # delegate-subagent trees. A host-declared routing scope
+        # (get_affinity_scope, #96811) outranks both — same resolution order
+        # as the OpenRouter profile.
+        sticky_key = get_affinity_scope() or get_conversation_context() or session_id
         if sticky_key:
             body["session_id"] = sticky_key
         provider_preferences = context.get("provider_preferences")
