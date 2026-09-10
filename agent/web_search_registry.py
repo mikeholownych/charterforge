@@ -33,61 +33,20 @@ extract-capable backend.
 from __future__ import annotations
 
 import logging
-import threading
-from typing import Dict, List, Optional
+from typing import Optional
 
+from agent.provider_registry import ProviderRegistry
 from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
 
-_providers: Dict[str, WebSearchProvider] = {}
-_lock = threading.Lock()
-
-
-def register_provider(provider: WebSearchProvider) -> None:
-    """Register a web search/extract provider.
-
-    Re-registration (same ``name``) overwrites the previous entry and logs
-    a debug message — makes hot-reload scenarios (tests, dev loops) behave
-    predictably.
-    """
-    if not isinstance(provider, WebSearchProvider):
-        raise TypeError(
-            f"register_provider() expects a WebSearchProvider instance, "
-            f"got {type(provider).__name__}"
-        )
-    name = provider.name
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("Web provider .name must be a non-empty string")
-    with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
-    if existing is not None:
-        logger.debug(
-            "Web provider '%s' re-registered (was %r)",
-            name, type(existing).__name__,
-        )
-    else:
-        logger.debug(
-            "Registered web provider '%s' (%s)",
-            name, type(provider).__name__,
-        )
-
-
-def list_providers() -> List[WebSearchProvider]:
-    """Return all registered providers, sorted by name."""
-    with _lock:
-        items = list(_providers.values())
-    return sorted(items, key=lambda p: p.name)
-
-
-def get_provider(name: str) -> Optional[WebSearchProvider]:
-    """Return the provider registered under *name*, or None."""
-    if not isinstance(name, str):
-        return None
-    with _lock:
-        return _providers.get(name.strip())
+_registry: ProviderRegistry[WebSearchProvider] = ProviderRegistry(
+    label="Web",
+    provider_cls=WebSearchProvider,
+    logger=logger,
+)
+_registry.export(globals())
 
 
 # ---------------------------------------------------------------------------
@@ -160,8 +119,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     matches the legacy preference; the dispatcher then returns a "set up a
     provider" error to the user.
     """
-    with _lock:
-        snapshot = dict(_providers)
+    snapshot = _registry.merged()
 
     def _capable(p: WebSearchProvider) -> bool:
         if capability == "search":
@@ -296,9 +254,3 @@ def get_active_extract_provider() -> Optional[WebSearchProvider]:
     """
     explicit = _read_config_key("web", "extract_backend") or _read_config_key("web", "backend")
     return _resolve(explicit, capability="extract")
-
-
-def _reset_for_tests() -> None:
-    """Clear the registry. **Test-only.**"""
-    with _lock:
-        _providers.clear()

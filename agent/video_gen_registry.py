@@ -20,60 +20,30 @@ same: the unconfigured fallback is filtered by ``is_available()`` so a box
 that has credentials for only one backend (e.g. DeepInfra, while the
 ``fal``/``xai`` plugins also register unconditionally) auto-selects it
 instead of returning ``None``.
+
+Scoped registration (per-profile multiplexed gateways) and the plugin
+snapshot/restore contract live in the shared
+:class:`agent.provider_registry.ProviderRegistry` engine; its bound methods
+are re-exported here under the historical module-level names.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
-from typing import Dict, List, Optional
+from typing import Optional
 
+from agent.provider_registry import ProviderRegistry
 from agent.video_gen_provider import VideoGenProvider
 
 logger = logging.getLogger(__name__)
 
 
-_providers: Dict[str, VideoGenProvider] = {}
-_lock = threading.Lock()
-
-
-def register_provider(provider: VideoGenProvider) -> None:
-    """Register a video generation provider.
-
-    Re-registration (same ``name``) overwrites the previous entry and logs
-    a debug message — this makes hot-reload scenarios (tests, dev loops)
-    behave predictably.
-    """
-    if not isinstance(provider, VideoGenProvider):
-        raise TypeError(
-            f"register_provider() expects a VideoGenProvider instance, "
-            f"got {type(provider).__name__}"
-        )
-    name = provider.name
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("Video gen provider .name must be a non-empty string")
-    with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
-    if existing is not None:
-        logger.debug("Video gen provider '%s' re-registered (was %r)", name, type(existing).__name__)
-    else:
-        logger.debug("Registered video gen provider '%s' (%s)", name, type(provider).__name__)
-
-
-def list_providers() -> List[VideoGenProvider]:
-    """Return all registered providers, sorted by name."""
-    with _lock:
-        items = list(_providers.values())
-    return sorted(items, key=lambda p: p.name)
-
-
-def get_provider(name: str) -> Optional[VideoGenProvider]:
-    """Return the provider registered under *name*, or None."""
-    if not isinstance(name, str):
-        return None
-    with _lock:
-        return _providers.get(name.strip())
+_registry: ProviderRegistry[VideoGenProvider] = ProviderRegistry(
+    label="Video gen",
+    provider_cls=VideoGenProvider,
+    logger=logger,
+)
+_registry.export(globals())
 
 
 def get_active_provider() -> Optional[VideoGenProvider]:
@@ -95,8 +65,7 @@ def get_active_provider() -> Optional[VideoGenProvider]:
     except Exception as exc:
         logger.debug("Could not read video_gen.provider from config: %s", exc)
 
-    with _lock:
-        snapshot = dict(_providers)
+    snapshot = _registry.merged()
 
     if configured:
         provider = snapshot.get(configured)
@@ -125,9 +94,3 @@ def get_active_provider() -> Optional[VideoGenProvider]:
         return available[0]
 
     return None
-
-
-def _reset_for_tests() -> None:
-    """Clear the registry. **Test-only.**"""
-    with _lock:
-        _providers.clear()

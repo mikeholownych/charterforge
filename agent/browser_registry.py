@@ -32,66 +32,30 @@ Note: there is no "capability" split here (unlike the web subsystem, which
 has search/extract/crawl). Every browser provider implements the full
 :class:`agent.browser_provider.BrowserProvider` lifecycle; the registry's
 job is purely selection, not capability routing.
+
+Scoped registration (per-profile multiplexed gateways) and the plugin
+snapshot/restore contract live in the shared
+:class:`agent.provider_registry.ProviderRegistry` engine; its bound methods
+are re-exported here under the historical module-level names.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
-from typing import Dict, List, Optional
+from typing import Optional
 
 from agent.browser_provider import BrowserProvider
+from agent.provider_registry import ProviderRegistry
 
 logger = logging.getLogger(__name__)
 
 
-_providers: Dict[str, BrowserProvider] = {}
-_lock = threading.Lock()
-
-
-def register_provider(provider: BrowserProvider) -> None:
-    """Register a cloud browser provider.
-
-    Re-registration (same ``name``) overwrites the previous entry and logs
-    a debug message — makes hot-reload scenarios (tests, dev loops) behave
-    predictably.
-    """
-    if not isinstance(provider, BrowserProvider):
-        raise TypeError(
-            f"register_provider() expects a BrowserProvider instance, "
-            f"got {type(provider).__name__}"
-        )
-    name = provider.name
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("Browser provider .name must be a non-empty string")
-    with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
-    if existing is not None:
-        logger.debug(
-            "Browser provider '%s' re-registered (was %r)",
-            name, type(existing).__name__,
-        )
-    else:
-        logger.debug(
-            "Registered browser provider '%s' (%s)",
-            name, type(provider).__name__,
-        )
-
-
-def list_providers() -> List[BrowserProvider]:
-    """Return all registered providers, sorted by name."""
-    with _lock:
-        items = list(_providers.values())
-    return sorted(items, key=lambda p: p.name)
-
-
-def get_provider(name: str) -> Optional[BrowserProvider]:
-    """Return the provider registered under *name*, or None."""
-    if not isinstance(name, str):
-        return None
-    with _lock:
-        return _providers.get(name.strip())
+_registry: ProviderRegistry[BrowserProvider] = ProviderRegistry(
+    label="Browser",
+    provider_cls=BrowserProvider,
+    logger=logger,
+)
+_registry.export(globals())
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +107,7 @@ def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
     matches the legacy preference; the dispatcher then falls back to local
     browser mode.
     """
-    with _lock:
-        snapshot = dict(_providers)
+    snapshot = _registry.merged()
 
     def _is_available_safe(p: BrowserProvider) -> bool:
         """Wrap ``is_available()`` so a buggy provider doesn't kill resolution."""
@@ -184,9 +147,3 @@ def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
             return provider
 
     return None
-
-
-def _reset_for_tests() -> None:
-    """Clear the registry. **Test-only.**"""
-    with _lock:
-        _providers.clear()
